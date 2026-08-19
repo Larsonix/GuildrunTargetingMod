@@ -1,0 +1,16 @@
+# Build output
+bin/
+obj/
+
+# Release packaging (all regenerable by packaging/package.ps1)
+packaging/cache/
+packaging/stage/
+packaging/stage-mod-only/
+packaging/dist/
+
+# Editors / OS
+.vs/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
