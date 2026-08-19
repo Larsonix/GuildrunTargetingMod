@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>GuildrunTargetingMod</AssemblyName>
+    <RootNamespace>GuildrunTargetingMod</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Deterministic>true</Deterministic>
+    <NoWarn>CS0436;CS0618;NU1701;MSB3277;CA1416</NoWarn>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <!-- Both are machine paths with a default Steam/dotnet install baked in. Override either on
+         the command line rather than editing this file, e.g.
+         dotnet build src/GuildrunTargetingMod.csproj -c Release -p:GameDir="D:\Games\Guildrun Demo"
+         GameDir must contain MelonLoader/ (run the game once after installing the loader so
+         MelonLoader/Il2CppAssemblies exists). -->
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Guildrun Demo</GameDir>
+    <Net6Runtime Condition="'$(Net6Runtime)' == ''">C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36</Net6Runtime>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="$(Net6Runtime)\*.dll"
+               Exclude="$(Net6Runtime)\api-ms-*.dll;$(Net6Runtime)\clretwrc.dll;$(Net6Runtime)\clrjit.dll;$(Net6Runtime)\coreclr.dll;$(Net6Runtime)\dbgshim.dll;$(Net6Runtime)\hostpolicy.dll;$(Net6Runtime)\Microsoft.DiaSymReader.Native.amd64.dll;$(Net6Runtime)\mscordaccore*.dll;$(Net6Runtime)\mscordbi.dll;$(Net6Runtime)\mscorrc.dll;$(Net6Runtime)\msquic.dll;$(Net6Runtime)\System.IO.Compression.Native.dll;$(Net6Runtime)\ucrtbase.dll"
+               Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\MelonLoader.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\0Harmony.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\net6\Il2CppInterop.Common.dll" Private="false" />
+    <Reference Include="$(GameDir)\MelonLoader\Il2CppAssemblies\*.dll" Private="false" />
+  </ItemGroup>
+</Project>
