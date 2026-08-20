@@ -77,10 +77,126 @@ the playout stops at arrival or at its own 600-tick ceiling before that duration
 
 - **Opening preview toggle.** The same picture for the whole board. While it is on, the game's
   overhead unit panels are hidden so the board stays readable. They come back on toggle-off, on
-  release into the fight, on leaving placement, and on every error path.
+  release into the fight, on leaving placement, and on every error path. Remembered between
+  battles and between sessions, in `PreviewStartsOn`, which the button writes on every deliberate
+  flip. Until 2.2.1 it was read-only to the mod and the preview restarted off in every battle.
 
-- **Arrow origin toggle**, left of the preview toggle, on by default. Off re-anchors every attack
-  arc at the units' current hexes, in hover and preview alike. Remembered between sessions.
+- **The update notice (2.4.0).** One request per launch to the GitHub releases API, on a thread pool
+  thread, parked in one volatile field and collected by `MenuUI` on the timer it already runs. No
+  marshalling and no lock : the object is built complete and never mutated, and a reference
+  assignment is atomic. A network call on Unity's thread would freeze the game for as long as the
+  connection takes to fail, and a Unity API touched off-thread is undefined behaviour, so the split
+  is not stylistic.
+
+  **Everything that can go wrong is silence.** Offline, DNS gone, rate limited, captive portal
+  serving a login page, a runtime missing a piece, a malformed answer. At most one log line. An
+  error dialog raised because someone is on a train is worth less than nothing.
+
+  Three decisions worth not re-litigating :
+
+  - **The releases API, not the download redirect.** One request answers both whether something is
+    newer AND the real asset URL. Building the URL from the tag would bake today's file-naming
+    convention into every copy already installed, so the day the naming changed, every older build
+    would send its players to a 404 that nothing could fix from our side.
+  - **It runs whether the mod is switched on or off**, and it is started BEFORE the leaderboard
+    guard. A guard that cannot be applied means a game update moved something, which is the single
+    moment a player most needs to hear a newer version exists ; `UnavailableBody` already tells them
+    to check for one, and this is the mod doing the checking. It is gated only on `CheckForUpdates`,
+    which is the one consent that is actually about contacting the internet.
+  - **The dialog names no button.** `DialogPanel` is a singleton shared with the game's own quit,
+    GDPR and Steam-survey dialogs, and its buttons carry the game's words. Writing a body around
+    "press OK" would describe a label this mod neither owns nor can keep, and relabeling the shared
+    panel would leak our words into the game's dialogs. The body says what happens instead.
+
+  `ReleaseManifest` is deliberately free of MelonLoader, Unity and networking, because the version
+  comparison is correct or silent and never loud : a mistake in it presents as an updater that never
+  fires, which is indistinguishable from one with nothing to say. Pure means it can be run outside a
+  game launch, and it has been, against the live API answer and every malformed shape.
+
+- **Arrow origin**, on by default, and since 2.3.0 a file setting with NO button and NO shortcut.
+  Off re-anchors every attack arc at the units' current hexes, in hover and preview alike. Set
+  through `ArrowsFromGhosts`.
+
+  It had a button until 2.3.0 took it away, on the same trade as the direction marks and for a
+  sharper reason : on is not a preference, it is the picture the mod exists to draw. An arc that
+  starts where a unit will be standing describes the fight that is going to happen ; one that starts
+  where it is standing now describes a moment that never occurs, since the unit has left before it
+  swings. Off is the shape the mod first shipped with, kept for anyone who attributes an arrow
+  faster that way, and that is not a question worth a button in a row where every button costs the
+  ones beside it.
+
+  **`OverlayRenderer.ArrowsFromGhosts` is still pushed every frame and still compared in
+  `PictureUnchanged`.** Do not "simplify" either away. The value is only fixed for a session, not
+  forever, and the comparison is what the cache contract requires of every visual input regardless
+  of how it got there.
+
+  **Upgrading forces it back on, once** (`Mod.ApplySettingsMigrations`, migration 1). Removing the
+  button would otherwise strand anyone who had switched it off in a state they most likely never
+  meant to keep, with no way back that did not begin with knowing the settings file exists. The
+  once is the whole design : `SettingsMigration` records the last migration applied, so a value set
+  by hand AFTER the update is never touched again. Forcing it every launch would not be a
+  migration, it would be the mod overruling the player forever, and it would make the setting a lie
+  with nothing on screen to explain it. The log line is printed only when a value actually moved,
+  so it can answer the one question it exists for.
+
+- **Attacks that land on more than one unit (2.5.0).** `SettledEntity` carries `ExtraTargets`
+  alongside its single `TargetPairing`, and the renderer draws an arc to each. Two mechanisms feed
+  it, and they are not variants of one another :
+
+  - **Reach**, measured from the UNIT. Three ability actions in the whole game loop an attack, and
+    `MultiHit` keys on the action class rather than the hero, so a respec or a rename cannot break
+    it. `FunkeAbilityAction` and `TillyAction` take every enemy within the caster's **live** Attack
+    Range ; `MingAbilityAction` takes distance exactly 1. Live, so a range rank modifier or a
+    specialization widens the picture with no code change.
+  - **Splash**, measured from the unit being ATTACKED, at distance exactly **1**. Authored as
+    `IsAdjacentToTriggerTargetCondition`, whose body is literally
+    `HexGridUtils.Distance(target, triggerTarget) == 1` : exactly one, not within one, because the
+    thing being struck is already struck by the ordinary attack. Five effects use it; three are the
+    Fire, Frost and Poison Dragons' auto attacks. **It lives on a PASSIVE**, which is why it was
+    invisible for four versions : nothing in this mod had ever read one. The path is
+    `PassiveAbilities`, then `GetAllEffects()`, then `ModularEffect.Condition`, read by native class name.
+
+  Every distance test calls the game's own `HexGridUtils.Distance`. Hex distance on an offset grid is
+  not the obvious formula, the game ships the answer, and a second implementation is a second thing
+  to drift. Splash arcs originate at the struck unit rather than the attacker, which is both the real
+  geometry and the thing that tells a player which neighbour to move.
+
+  **Interop trap** : the wrapper for the game's read-only list exposes **only an indexer**, with no
+  `Count` and no `GetEnumerator`, so neither a `for` nor a `foreach` compiles against it. Cast to the
+  concrete `List` first.
+
+- **Areas nobody can step out of are not drawn (2.5.0).** The Final Boss dragons' breath is authored
+  as a circle of radius 12 because what it means is "every enemy"; painting that as a ring around the
+  dragon invited a dodge that does not exist. An outline is suppressed when its reach is at least
+  half the board's corner-to-corner span, measured from **the board** (`PredictionResult.BoardWidth`
+  / `BoardHeight`, carried off the playout's own `BattleConfig`) and never from where the units
+  happen to stand. A huddled team is not playing on a smaller board, and measuring the huddle would
+  shrink the threshold until an ordinary zone was suppressed as unavoidable.
+
+  On the shipped 7x8 board the threshold is **11.55** world units : the dragons' 12.0 is suppressed
+  and the next largest real area is 6.0, so there is no near miss. Comparing a simulation radius
+  against a Unity-grid span is sound because the sim's cell-to-world table is itself computed from
+  Unity's Grid : they differ by about one fifteen-thousandth of a hex (see `CellWorldTable`).
+
+- **Ability areas toggle** (2.3.0), leftmost of the four, on by default. Decides whether the dashed
+  area outlines are drawn at all, for heroes and enemies alike. It is a plain visibility switch over
+  what each mode already shows rather than a mode of its own : the hovered unit's area in hover,
+  every unit's with the preview on, following a hero while dragging, and none of them when it is
+  off. Remembered in `AbilityAreas`, written by the button.
+
+  Two gates, for two jobs, and both are needed. `OverlayRenderer.ShowAreas` is checked at the top
+  of `DrawAoe`, which covers both places areas are asked for and means a third caller added later
+  inherits the switch rather than having to remember it ; **and it is in `PictureUnchanged` and
+  `RememberPicture` beside the other display switches**, without which the button would flip and
+  leave the outlines on screen until something unrelated forced a redraw. `AoeShapes.Update(bool)`
+  takes the same answer so the twice-a-second scan stops as well as the drawing, since that scan is
+  the entire cost of the feature. It goes quiet once on the way down rather than clearing every
+  frame, because `Clear` bumps the version and the renderer redraws whenever the version moves.
+
+  Kept apart from `Capabilities.AoeOutline` on purpose. That one means the feature broke and said so
+  in the log ; this one means the player asked for it to stop. Both must be true to draw, and
+  neither writes the other, so a fault can never flip a button the player owns and a deliberate
+  choice never reads as a defect.
 
 - **Direction marks**, off by default, and the only display option with NO button and NO shortcut.
   Adds a smaller chevron at the middle of every arc and movement line, skipped on lines shorter
@@ -88,18 +204,25 @@ the playout stops at arrival or at its own 600-tick ceiling before that duration
 
   It had a button until playtest feedback took it away : once see-through units made the board
   readable, this was the least useful of the four, and a button nobody presses is a button in the
-  way of the three that matter. The feature is cheap to keep and the row is not, which is the
-  general shape of the trade whenever a fourth control is proposed.
+  way of the ones that do get pressed. The feature is cheap to keep and the row is not, which is
+  the general shape of the trade whenever another control is proposed.
 
-- **Keyboard shortcuts, placement only.** P for the preview, F for the arrow origin, T for
-  see-through units, each rebindable to any `UnityEngine.InputSystem.Key` name. They set the
-  toggle's own value, so a key and a click take one path and cannot drift apart.
+  That trade was taken the other way in 2.3.0 for the ability areas, and the difference is the
+  whole test : the direction marks were a control nobody had asked for, sitting next to three that
+  were being used, while the areas button was asked for by players who wanted the outlines gone and
+  had no way to do it. A row grows for a question people are actually asking.
+
+- **Keyboard shortcuts, placement only.** P for the preview, T for see-through units, G for the
+  ability areas, each rebindable to any `UnityEngine.InputSystem.Key` name. They set the toggle's
+  own value, so a key and a click take one path and cannot drift apart. A shortcut exists only
+  where a button does : F went with the arrow origin button in 2.3.0, and `ArrowOriginKey` with it.
 
   Two things chose those three, neither of them taste. The game already owns Space, Enter, Tab, H,
   Shift and Escape, and its own translated text is the only list of that there is, since there is
   no keybinding screen and its input actions are mouse-only. And a key is a physical position, so
-  A, Q, Z, W and M all land under a different finger on common non-QWERTY layouts, while P, F and
-  T do not move. The label on the tooltip comes from the keyboard the player is actually using, so
+  A, Q, Z, W and M all land under a different finger on common non-QWERTY layouts, while P, T
+  and G do not move. That test is also why the areas are not on A for area or Z for zone, which
+  were the two obvious letters and are both disqualified by it. The label on the tooltip comes from the keyboard the player is actually using, so
   an unusual layout shows the character its own key produces.
 
 - **Shortcut display follows the game's own shape.** The game writes a control's key in round
@@ -118,7 +241,7 @@ the playout stops at arrival or at its own 600-tick ceiling before that duration
   changes, on a larger per-frame budget, with a cache per layout, so a hex crossed twice and the
   drop itself both render instantly. Setting `DragLivePreview` to false restores the old
   hide-while-dragging behaviour, and any fault in the drag path degrades to that same behaviour.
-  The three buttons stay put. The preview starts off in every battle ; the other two persist.
+  The four buttons stay put, and all four persist.
 
   - **The drag is read from the game's state, never from input.** A hero on the board sits exactly
     on its tile centre, and a hero in hand is moved to the cursor's ground point and lifted, every
@@ -318,17 +441,70 @@ starting `tearing down`.
 10. Play on a board that runs out of ticks. Check the English tooltips and the "Still moving"
    notice.
 
-11. Shortcuts. Press P, F and T during placement and confirm each flips the matching button with
+11. Shortcuts. Press P, T and G during placement and confirm each flips the matching button with
    the same feedback a click gives. Confirm each tooltip reads `Name (Key)`. Confirm they do
    nothing outside placement. Set `PreviewKey` to a nonsense value and confirm the mod falls back
    to P, logs one line, and leaves the other two working. There must be exactly THREE of the mod's
-   buttons on the row : the direction marks lost theirs, and D no longer does anything. Setting
-   `MidlineArrowheads=true` in the file must still draw them.
+   buttons on the row, left to right : ability areas, opening preview, see-through units. **Two
+   keys must now do nothing** : D, whose direction-marks button went in 2.0.0, and **F, whose arrow
+   origin button went in 2.3.0**. Both features are still there and still set from the file, so
+   confirm `MidlineArrowheads=true` still draws the chevrons and `ArrowsFromGhosts=false` still
+   re-anchors every arc at the units' current hexes.
 
-12. **See-through units and the preview's starting state.** T must fade every unit for the whole
-   placement, hovering or not, preview on or off, and restore them the instant it is switched back.
-   Set `PreviewStartsOn=true` and confirm the next battle opens with the preview already on and the
-   button already lit ; set it back and confirm the battle after that opens with it off.
+11b. **The one-time settings migration (2.3.0).** Three launches, and the second is the one that
+   can fail silently. It needs the settings file edited between each.
+
+   1. **It fires.** Set `ArrowsFromGhosts = false` and `SettingsMigration = 0`, launch. The file
+      must come back with `ArrowsFromGhosts = true` and `SettingsMigration = 1`, the log must carry
+      the `settings brought forward` line, and the arcs must anchor at the settled hexes.
+   2. **It does not fire again.** Now set `ArrowsFromGhosts = false` and leave `SettingsMigration`
+      at `1`. Launch. The value must **stay false**, there must be **no** `settings brought forward`
+      line, and the arcs must anchor at the current hexes. This is the whole test. Step 1 passing
+      on its own is equally consistent with a mod that overrules the player on every launch, which
+      is the defect, and it would look identical to anyone who only ever ran step 1.
+   3. **It is quiet on a file that had nothing to change.** Delete the whole `[GuildrunTargetingMod]`
+      section, launch. `SettingsMigration` must be written as `1`, `ArrowsFromGhosts` as `true`, and
+      there must be **no** log line, since nothing moved and a line here would claim a change that
+      never happened on every fresh install.
+
+11c. **The update notice (2.4.0).** The parsing and the version comparison are already proved
+   outside the game : `ReleaseManifest` is pure, and the harness in the session scratchpad runs the
+   real source against the live API answer plus every malformed shape, including the `2.10.0` versus
+   `2.9.0` case that a string comparison gets wrong. Re-run that before touching it. What a launch
+   has to prove is the half a harness cannot :
+
+   1. **It appears at all.** Set `LastUpdateNoticeVersion` to empty and `ModVersion` lower than the
+      published release (or publish something newer), launch, and reach the main menu. The dialog
+      must name the newer version and your current one, and must arrive AFTER the intro rather than
+      on top of it.
+   2. **Accepting opens both.** The browser must land on the mod-only zip for the newest release,
+      not the release page and not an older asset. The game folder must open beside it. Under Proton
+      the folder may not open at all, which is expected and why the path is logged and the dialog
+      says where the file goes ; the download must still work.
+   3. **Once per version.** Relaunch. There must be no dialog, and the log must say the version has
+      already been offered. This is the half that fails quietly, because a second dialog looks like
+      the feature working rather than the feature repeating.
+   4. **It never fights the leaderboard notice.** On a fresh install with both due, the leaderboard
+      notice must come first and the update notice must wait for a later tick. Two modals in one
+      frame is the case the game logs its own error for.
+   5. **Offline is silent.** Disconnect, launch, reach the menu. No dialog, no error, one log line.
+   6. **The setting is obeyed.** `CheckForUpdates=false`, launch, and confirm no request is made and
+      nothing is shown.
+
+12. **See-through units, and all three buttons remembering (2.2.1, 2.3.0).** T must fade every unit for the
+   whole placement, hovering or not, preview on or off, and restore them the instant it is switched
+   back.
+
+   Then the memory, with `UserData/MelonPreferences.cfg` open beside the game. Starting from the
+   preview off, switch it on during a placement : `PreviewStartsOn` must turn `true` on the click.
+   Start the fight, and enter the next placement : the preview must be on and its button lit, and
+   the line must **still** read `true` even though the mod itself switched the preview off in
+   between. That last half is the whole test. The mod moves this button twice a battle, and if
+   either of those movements reached the settings file the player's own choice would be overwritten
+   by the teardown within one fight, which is a defect no single placement can show. Switch it off
+   in-game and confirm the line returns to `false` and stays there. Same round trip for T and G,
+   and the same again through the P, T and G shortcuts rather than the buttons, since a key press
+   goes through the button and must write identically.
 
 13. **The placement marks, both halves at once.** Equip a hero with Sentinel's Plate or Deadeye Hood
    and take a run carrying one of Frontline Defender, Frontline Embiggener or Frontline Barricader.
@@ -363,16 +539,51 @@ starting `tearing down`.
 
 14. **The area outline.** Look for `ability areas: N unit(s) with a footprint to draw, M ability(ies)
    with none, K left undrawn as ambiguous`. On a board with a unit that has one, the outline must be
-   a broken ring, not a solid one, and must sit on the settled hex with the arrow origin toggle on
-   and on the current hex with it off. Toggle F back and forth and watch it move with the arrows.
+   a broken ring, not a solid one, and must sit on the settled hex with `ArrowsFromGhosts` on and on
+   the current hex with it off. That is now two launches rather than one keypress, and it is still
+   worth both : the outline must be anchored by the same rule the arrows are, and a version where
+   they disagreed would look right in every screenshot taken with the default.
    It must vanish while dragging, like everything else, and it must be gone before the fight is
    visible. A circle must read as a circle from every camera angle : if it looks like an egg, the
    per-ring camera nudge has regressed to a per-point one.
+
+14a. **The areas button (2.3.0), and the frame it is pressed on.** The frame is the whole test.
+   Hover a unit that has an area and hold the pointer perfectly still, then press **G**. The outline
+   must go **on that frame**, with nothing else moving and the pointer not moved. If it only clears
+   once you jog the mouse or hover something else, `ShowAreas` is missing from `PictureUnchanged`
+   and the renderer is holding a stale picture ; that is the one defect this feature can ship with
+   and look fine in every other test, because every other test moves something.
+
+   Then the rest of it. Off, no outline in hover, none with the preview on, none while dragging,
+   on enemies as well as heroes. `AbilityAreas` must follow the click in
+   `UserData/MelonPreferences.cfg`, and the button must come back the way it was left in the next
+   battle and the next session. Press **G** again and the outlines must return on the next frame,
+   not up to half a second later, which is what `Clear` leaving the scan due immediately buys.
+   Finally, with the areas off, `Perf` must show the area slot at effectively zero : the scan is the
+   cost of this feature and switching it off is supposed to stop paying it.
 
 14b. **Hover after leaving the window.** Alt-tab away mid-placement, click back in, and hover a
    unit WITHOUT touching a hero first. It must respond immediately. Before, it stayed dead until a
    hero was picked up, because that is what rebuilt the model-to-unit map. With `DevLog` on, a
    rebuild logs `unit view map rebuilt: the pointer was over a model it did not know`.
+
+14c. **Multi-hit attacks and the suppressed boss circles (2.5.0).** Four checks, and the boss one
+   needs a Final Boss floor.
+
+   1. **Funke.** Place him where two or more enemies sit within his Attack Range and hover him. One
+      arc per enemy in range, all in team colour, not one. Give him a range rank modifier or the
+      range specialization and confirm the picture WIDENS on the next placement, since range is read
+      live rather than from the authored stat. Ming is the same test at distance exactly one.
+   2. **The Dragon cleave.** On a Final Boss floor, put two Heroes side by side within reach. The
+      Dragon must draw its ordinary arc to the Hero it is aimed at, **plus** an arc to each Hero on
+      an adjacent hex, and those extra arcs must start at the STRUCK Hero rather than at the Dragon.
+      Move the neighbour one hex away and its arc must disappear. That last half is the test : if the
+      arc survives the move, the splash is being measured from the wrong unit.
+   3. **The boss circle is gone.** The same floor must show NO huge ring around the Dragon. On any
+      mushroom-mage board the storm circle must still be drawn, and Gustav's Blizzard too. If either
+      of those vanished, the suppression threshold is being measured from the units instead of from
+      the board.
+   4. **Everything else is unchanged.** Any ordinary board: one arc per unit, exactly as before.
 
 15. **The Rift Seal mark, which needs a Red Rift run.** Three states, one indicator, and no text on
    screen in any of them.

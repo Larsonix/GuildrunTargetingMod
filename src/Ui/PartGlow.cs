@@ -7,13 +7,17 @@ using Il2Cppgg.leyline.balancing.Data;
 using Il2CppEmber.Balancing;
 using Il2CppEmber.Balancing.Sheets.Abilities.ActiveAbilities;
 using Il2CppEmber.Balancing.Sheets.Abilities.PassiveAbilities;
+using Il2CppEmber.Balancing.Sheets.Characters;
 using Il2CppEmber.Balancing.Sheets.RankModifiers;
 using Il2CppEmber.Balancing.SimulationBridge;
+using Il2CppEmber.Scopes.GameRun.GameRegistry.Data;
 using Il2CppEmber.Scopes.GameRun.GameRegistry.Data.Characters;
 using Il2CppEmber.Scopes.GameRun.UI.HeroCard;
 using Il2CppEmber.Scopes.GameRun.UI.HeroCard.Elements;
 using Il2CppEmber.Scopes.GameRun.UI.Relics;
 using Il2CppEmber.Scopes.GameRun.UI.Slots;
+using Il2CppEmber.Scopes.GameRun.UI.Slots.HeroPanel;
+using Il2Cppgg.leyline.core.Mvcs.Model;
 using MelonLoader;
 using UnityEngine;
 using UnityEngine.UI;
@@ -89,6 +93,11 @@ internal sealed class PartGlow
     // on its own. It is now one of two marks and is proportioned as one of two.
     private const float SlashThicknessFactor = 0.050f;
     private const float SlashMinThickness = 3f;
+    // How far out of an ability view the search for its owning Hero may climb before giving up. A
+    // card is a handful of levels deep and the bar that holds every card sits just above it, so this
+    // is a backstop against a deep hierarchy costing a full subtree walk per level per view, not a
+    // number anyone should need to tune. The ambiguity test below is what actually stops the climb.
+    private const int MaxCardClimb = 8;
 
     private readonly Capabilities _capabilities;
     private readonly Func<string, PartState> _forItem;
@@ -121,12 +130,25 @@ internal sealed class PartGlow
     private bool _fullSweepPending = true;
     // The Hero cards, which carry the largest of the three surfaces : rank modifiers and passives.
     private readonly List<HeroRankModifiersView> _abilityViews = new();
+    // Kept separate because sharing the rank-card packing rule would point at innocent abilities.
+    private readonly List<HeroPanelAbilitiesView> _panelAbilityViews = new();
+    // The bottom Hero bar uses the full-card tiles but packs them by a third, incompatible rule.
+    private readonly List<HeroCardAbilitiesView> _bottomAbilityViews = new();
     private readonly Dictionary<IntPtr, string> _heroKeysByCard = new();
     private readonly Dictionary<IntPtr, EntityId> _lastHeroIds = new();
     private readonly Dictionary<IntPtr, Image> _platesByContainer = new();
     private readonly HashSet<IntPtr> _containersWithoutPlate = new();
+    // What ANSWERED the question "which Hero is this card about", per ability view. Never the answer
+    // itself. A pooled view handed to a different Hero would go on reporting the old one, and
+    // proving the old Hero is still alive does not prove it is still THIS view's Hero. Holding the
+    // source and reading through it each frame keeps the answer current while still paying for the
+    // search only once. The surfaces keep separate caches so one native pointer lifetime cannot be
+    // mistaken for another, and a MiniHeroCard can answer through a PlaceholderSlotView instead.
     private readonly Dictionary<IntPtr, HeroCardView> _cardsByAbilityView = new();
-    private readonly HashSet<IntPtr> _abilityViewsWithoutCard = new();
+    private readonly Dictionary<IntPtr, HeroCardView> _cardsByPanelAbilityView = new();
+    private readonly Dictionary<IntPtr, BottomHeroView> _bottomHeroesByAbilityView = new();
+    private readonly Dictionary<IntPtr, HeroCardView> _cardsByBottomAbilityView = new();
+    private readonly Dictionary<IntPtr, PlaceholderSlotView> _ownedSlotByAbilityView = new();
     private NullableRaw.FieldRef _itemIdField;
     private bool _itemIdFieldResolved;
     private RelicUIController _relicUi;
@@ -146,6 +168,39 @@ internal sealed class PartGlow
     private int _abilityMismatches;
     private int _abilityFaults;
     private string _lastAbilityFault;
+    private bool _loggedAbilityFault;
+    private bool _loggedAbilityLookup;
+    /// <summary>The player's verbose-log switch; the key trace above is diagnostic only.</summary>
+    public Func<bool> DevLog { get; set; }
+    private bool _loggedAbilityBlocked;
+    // How the ability half of the last pass went. Counted because the report could not previously
+    // tell "this board had no ability worth marking" from "the ability walk never ran at all", and
+    // those two look identical from outside : both are silence. They were NOT the same thing. Every
+    // shipped log said 0 mismatches and 0 faults while the walk was in fact returning before it
+    // reached a single slot, because the owning Hero could not be identified, and nothing counted
+    // that. An instrument has to be able to say which of its zeroes it means.
+    private int _cardsResolved;
+    private int _cardsUnresolved;
+    // The most any single pass of this placement saw, and these are the REPORTED numbers.
+    //
+    // The per-pass values above answered nothing on their own, for the same reason the area counters
+    // did not: the report prints when placement ENDS, and by then the placement bar is being torn
+    // down, so a pass that saw four cards all placement long reports zero. Measured 2026-08-20, on
+    // a run where 32 ability panels had been found and the counters still both read zero. "Did this
+    // ever happen" needs a peak, not a snapshot of the last moment.
+    private int _peakCardsResolved;
+    private int _peakCardsUnresolved;
+    private int _peakAbilityIcons;
+    // Skipped slots are counted PER PASS and reported as a peak, like everything else here.
+    //
+    // They used to accumulate over the whole placement, which was harmless only while the ability
+    // walk never ran. It runs now, and one of the skips is entirely legitimate and happens on every
+    // frame: the specialization slot is written twice by the game, active then passive, so whichever
+    // of the two is not on screen is refused every single pass. Accumulated, that reports several
+    // thousand skipped slots on a healthy board and buries a real packing failure in noise. A peak
+    // says "at most N slots were refused in any one pass", which is the number worth reading.
+    private int _peakAbilityMismatches;
+    private int _peakAbilityFaults;
 
     public PartGlow(Capabilities capabilities, Func<string, PartState> forItem, Func<string, PartState> forRelic,
         Func<string, string, PartState> forAbility, Func<float> markLapSeconds, Func<bool> anythingBlocked)
@@ -208,8 +263,10 @@ internal sealed class PartGlow
             // a panel is shut and turn an evidence-driven search back into a periodic one, twice as
             // often as the timer it replaced. Only "the search itself came up empty" is the case the
             // old timer existed for.
-            bool foundNothing = _slots.Count == 0 && _abilityViews.Count == 0;
+            bool foundNothing = _slots.Count == 0 && _abilityViews.Count == 0 &&
+                                _panelAbilityViews.Count == 0 && _bottomAbilityViews.Count == 0;
             bool searchNeeded = !_searched || AnySlotDestroyed() || AnyAbilityViewDestroyed() ||
+                                AnyPanelAbilityViewDestroyed() || AnyBottomAbilityViewDestroyed() ||
                                 (foundNothing && _anythingBlocked != null && _anythingBlocked());
             if (searchNeeded && (!_searched ||
                 (Time.realtimeSinceStartup >= _nextSearchAt && _sceneSearchBackoff.ShouldTry())))
@@ -263,15 +320,27 @@ internal sealed class PartGlow
         _sawDestroyedSlot = false;
         _fullSweepPending = true;
         _abilityViews.Clear();
+        _panelAbilityViews.Clear();
+        _bottomAbilityViews.Clear();
         ClearAbilityIdMemos();
         _platesByContainer.Clear();
         _containersWithoutPlate.Clear();
         _cardsByAbilityView.Clear();
-        _abilityViewsWithoutCard.Clear();
+        _cardsByPanelAbilityView.Clear();
+        _bottomHeroesByAbilityView.Clear();
+        _cardsByBottomAbilityView.Clear();
+        _ownedSlotByAbilityView.Clear();
         _itemIdField = default;
         _itemIdFieldResolved = false;
         _abilityMismatches = 0;
         _abilityFaults = 0;
+        _cardsResolved = 0;
+        _cardsUnresolved = 0;
+        _peakCardsResolved = 0;
+        _peakCardsUnresolved = 0;
+        _peakAbilityIcons = 0;
+        _peakAbilityMismatches = 0;
+        _peakAbilityFaults = 0;
         _relicUi = null;
         _nextSearchAt = 0f;
         _sceneSearchBackoff.Reset();
@@ -325,6 +394,20 @@ internal sealed class PartGlow
     {
         for (int i = 0; i < _abilityViews.Count; i++)
             if (_abilityViews[i] == null) return true;
+        return false;
+    }
+
+    private bool AnyPanelAbilityViewDestroyed()
+    {
+        for (int i = 0; i < _panelAbilityViews.Count; i++)
+            if (_panelAbilityViews[i] == null) return true;
+        return false;
+    }
+
+    private bool AnyBottomAbilityViewDestroyed()
+    {
+        for (int i = 0; i < _bottomAbilityViews.Count; i++)
+            if (_bottomAbilityViews[i] == null) return true;
         return false;
     }
 
@@ -395,6 +478,41 @@ internal sealed class PartGlow
                 _abilityViews.Add(card);
             }
             if (_abilityViews.Count > liveBefore) foundNew = true;
+        }
+        if (_panelAbilityViews.Count == 0 || AnyPanelAbilityViewDestroyed())
+        {
+            int liveBefore = 0;
+            for (int i = 0; i < _panelAbilityViews.Count; i++)
+                if (_panelAbilityViews[i] != null) liveBefore++;
+            _panelAbilityViews.Clear();
+            _cardsByPanelAbilityView.Clear();
+            List<HeroPanelAbilitiesView> panels = RuntimeDiscovery.FindAll<HeroPanelAbilitiesView>();
+            for (int i = 0; i < panels.Count; i++)
+            {
+                HeroPanelAbilitiesView panel = panels[i];
+                // A prefab here would receive marks that every later placement bar inherits.
+                if (panel == null || !panel.gameObject.scene.IsValid()) continue;
+                _panelAbilityViews.Add(panel);
+            }
+            if (_panelAbilityViews.Count > liveBefore) foundNew = true;
+        }
+        if (_bottomAbilityViews.Count == 0 || AnyBottomAbilityViewDestroyed())
+        {
+            int liveBefore = 0;
+            for (int i = 0; i < _bottomAbilityViews.Count; i++)
+                if (_bottomAbilityViews[i] != null) liveBefore++;
+            _bottomAbilityViews.Clear();
+            _bottomHeroesByAbilityView.Clear();
+            _cardsByBottomAbilityView.Clear();
+            List<HeroCardAbilitiesView> views = RuntimeDiscovery.FindAll<HeroCardAbilitiesView>();
+            for (int i = 0; i < views.Count; i++)
+            {
+                HeroCardAbilitiesView view = views[i];
+                // A prefab here would receive marks that every later bottom Hero bar inherits.
+                if (view == null || !view.gameObject.scene.IsValid()) continue;
+                _bottomAbilityViews.Add(view);
+            }
+            if (_bottomAbilityViews.Count > liveBefore) foundNew = true;
         }
         if (_relicUi == null)
         {
@@ -526,27 +644,276 @@ internal sealed class PartGlow
     /// </remarks>
     private void CollectAbilities()
     {
+        // Per pass, like _tracked itself, so the report describes the last frame rather than
+        // accumulating a number that only grows with how long the placement lasted.
+        _cardsResolved = 0;
+        _cardsUnresolved = 0;
+        _abilityMismatches = 0;
+        _abilityFaults = 0;
         for (int i = 0; i < _abilityViews.Count; i++)
         {
             HeroRankModifiersView view = _abilityViews[i];
             if (view == null || !view.gameObject.activeInHierarchy) continue;
             // Per view, so one card that is mid-rebuild cannot cost the other cards on screen.
             try { CollectOneCard(view); }
-            catch (Exception e) { _abilityFaults++; _lastAbilityFault = e.Message; }
+            catch (Exception e) { NoteAbilityFault(e); }
         }
+        for (int i = 0; i < _panelAbilityViews.Count; i++)
+        {
+            HeroPanelAbilitiesView view = _panelAbilityViews[i];
+            if (view == null) continue;
+            // One panel can be handed new data while the other cards remain safe to read.
+            try
+            {
+                if (!view.gameObject.activeInHierarchy) continue;
+                CollectOnePanelCard(view);
+            }
+            catch (Exception e) { NoteAbilityFault(e); }
+        }
+        for (int i = 0; i < _bottomAbilityViews.Count; i++)
+        {
+            HeroCardAbilitiesView view = _bottomAbilityViews[i];
+            if (view == null) continue;
+            // One empty or rebuilding bar slot must not cost the other Heroes on screen.
+            try
+            {
+                if (!view.gameObject.activeInHierarchy) continue;
+                CollectOneBottomCard(view);
+            }
+            catch (Exception e) { NoteAbilityFault(e); }
+        }
+        if (_cardsResolved > _peakCardsResolved) _peakCardsResolved = _cardsResolved;
+        if (_cardsUnresolved > _peakCardsUnresolved) _peakCardsUnresolved = _cardsUnresolved;
+        if (_abilityMismatches > _peakAbilityMismatches) _peakAbilityMismatches = _abilityMismatches;
+        if (_abilityFaults > _peakAbilityFaults) _peakAbilityFaults = _abilityFaults;
+        int abilityIcons = AbilityIconsNow;
+        if (abilityIcons > _peakAbilityIcons) _peakAbilityIcons = abilityIcons;
+    }
+
+    private void CollectOnePanelCard(HeroPanelAbilitiesView view)
+    {
+        var slots = view._cachedAbilityViews;
+        if (slots == null || slots.Count == 0) return;
+        IReadOnlyHeroData data = ResolvePanelHero(view);
+        if (data == null) { _cardsUnresolved++; return; }
+        _cardsResolved++;
+
+        IntPtr viewKey = view.Pointer;
+        EntityId heroId = data.HeroId.ToEntityId();
+        if (!_lastHeroIds.TryGetValue(viewKey, out EntityId lastHeroId) ||
+            !NullableRaw.SameRawId(in lastHeroId, in heroId))
+        {
+            _lastHeroIds[viewKey] = heroId;
+            _heroKeysByCard[viewKey] = heroId.ToString();
+        }
+        string heroKey = _heroKeysByCard[viewKey];
+
+        ICharacterEntry heroEntry = data.HeroRef.ToEntry()?.TryCast<ICharacterEntry>();
+        if (heroEntry == null) return;
+        ICharacterData characterData = data.TryCast<ICharacterData>();
+        if (characterData == null) return;
+
+        // Read the concrete rank dictionary before naming fixed slots. Rank modifiers replace those
+        // slots, and missing the collision would mark a rank icon as the starting or specialization
+        // role.
+        var ranks = characterData.AppliedRankModifiers?
+            .TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, BalancingRef<IRankModifierEntry>>>();
+        if (ranks == null) { _abilityMismatches++; return; }
+        HashSet<int> rankIndices = new();
+        foreach (int key in ranks.Keys) rankIndices.Add(key + 1);
+
+        Sprite startingIcon = null;
+        if (heroEntry.StartWithActiveAbility)
+        {
+            BalancingRef<IActiveAbilityEntry> abilityRef = heroEntry.ActiveAbilityRef;
+            IActiveAbilityEntry entry = abilityRef.ToEntry();
+            if (entry != null) startingIcon = entry.Icon;
+        }
+        else
+        {
+            BalancingRef<IPassiveAbilityEntry> abilityRef = heroEntry.PassiveAbilityRef;
+            IPassiveAbilityEntry entry = abilityRef.ToEntry();
+            if (entry != null) startingIcon = entry.Icon;
+        }
+        if (!rankIndices.Contains(0) && startingIcon != null)
+            TrackPanelAbilitySlot(slots, 0, heroKey, PlacementSnapshot.StartingAbilityRole, startingIcon);
+
+        List<Sprite> rankIcons = new();
+        foreach (int key in ranks.Keys)
+        {
+            BalancingRef<IRankModifierEntry> rankRef = ranks[key];
+            IRankModifierEntry entry = rankRef.ToEntry();
+            if (entry != null)
+            {
+                if (entry.Icon != null) rankIcons.Add(entry.Icon);
+                TrackPanelAbilitySlot(slots, key + 1, heroKey,
+                    PlacementSnapshot.RankModifierRole(rankRef.Id.ToString()), entry.Icon);
+            }
+        }
+
+        // Specialization is a nullable BalancingRef and cannot be read safely. Elimination avoids
+        // that interop fault, while rejecting a known icon prevents a colliding start or rank slot
+        // from being mislabeled as the specialization.
+        if (!rankIndices.Contains(1) && slots.Count > 1)
+        {
+            HeroPanelAbilityView abilityView = slots[1];
+            Image icon = abilityView?._icon;
+            if (abilityView != null && abilityView.gameObject.activeInHierarchy && icon != null &&
+                icon.sprite != null)
+            {
+                bool knownIcon = icon.sprite == startingIcon;
+                for (int i = 0; !knownIcon && i < rankIcons.Count; i++)
+                    knownIcon = icon.sprite == rankIcons[i];
+                if (knownIcon) _abilityMismatches++;
+                else TrackPanelAbilitySlot(slots, 1, heroKey,
+                    PlacementSnapshot.SpecializationRole, icon.sprite);
+            }
+        }
+    }
+
+    private void TrackPanelAbilitySlot(Il2CppSystem.Collections.Generic.List<HeroPanelAbilityView> slots,
+        int index, string heroKey, string entryKey, Sprite expected)
+    {
+        if (index < 0 || index >= slots.Count) return;
+        HeroPanelAbilityView abilityView = slots[index];
+        if (abilityView == null || !abilityView.gameObject.activeInHierarchy) return;
+        Image icon = abilityView._icon;
+        if (icon == null) return;
+
+        // A changed packing rule must silence this slot, not accuse a different ability.
+        if (expected == null || icon.sprite != expected) { _abilityMismatches++; return; }
+
+        // Use the filing side's role verbatim. Entry ids cannot be recovered from its non-blittable
+        // nullable origin data, so using an entry id here would split lookup from filing again.
+        _tracked.Add(new Tracked(abilityView.transform, FindPanelPlate(abilityView, icon), entryKey,
+            heroKey, abilityView.GetInstanceID(), PartKind.Ability));
+    }
+
+    // One card the ability walk could not read. Counted for the report, and the WHOLE exception is
+    // said once per session.
+    //
+    // The message on its own is not a diagnosis. "Object reference not set to an instance of an
+    // object" is what four bottom-bar cards reported on 2026-08-20 and it names no line, no surface
+    // and no field, which is a play session spent learning what one stack trace carries for free.
+    // The mod ships its symbol file beside itself precisely so this names a line. Same reasoning, and
+    // the same shape, as ReportEffectFault in PositionalGlow.
+    private void NoteAbilityFault(Exception e)
+    {
+        _abilityFaults++;
+        _lastAbilityFault = e.Message;
+        if (_loggedAbilityFault) return;
+        _loggedAbilityFault = true;
+        MelonLogger.Warning("[TargetingMod] an ability card could not be read; the rest of the board " +
+                            "is unaffected. Full fault follows:\n" + e);
+    }
+
+    private void CollectOneBottomCard(HeroCardAbilitiesView view)
+    {
+        var slots = view._abilities;
+        if (slots == null || slots.Length == 0) return;
+        IReadOnlyHeroData data = ResolveBottomHero(view);
+        if (data == null) { _cardsUnresolved++; return; }
+        _cardsResolved++;
+
+        IntPtr viewKey = view.Pointer;
+        EntityId heroId = data.HeroId.ToEntityId();
+        if (!_lastHeroIds.TryGetValue(viewKey, out EntityId lastHeroId) ||
+            !NullableRaw.SameRawId(in lastHeroId, in heroId))
+        {
+            _lastHeroIds[viewKey] = heroId;
+            _heroKeysByCard[viewKey] = heroId.ToString();
+        }
+        string heroKey = _heroKeysByCard[viewKey];
+
+        ICharacterEntry heroEntry = data.HeroRef.ToEntry()?.TryCast<ICharacterEntry>();
+        if (heroEntry == null) return;
+        ICharacterData characterData = data.TryCast<ICharacterData>();
+        if (characterData == null) return;
+
+        // This view puts a rank at key - 1. Reserve those indices first or a rank collision can be
+        // falsely named as the starting ability or specialization.
+        var ranks = characterData.AppliedRankModifiers?
+            .TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, BalancingRef<IRankModifierEntry>>>();
+        if (ranks == null) { _abilityMismatches++; return; }
+        HashSet<int> rankIndices = new();
+        foreach (int key in ranks.Keys) rankIndices.Add(key - 1);
+
+        Sprite startingIcon = null;
+        if (heroEntry.StartWithActiveAbility)
+        {
+            BalancingRef<IActiveAbilityEntry> abilityRef = heroEntry.ActiveAbilityRef;
+            IActiveAbilityEntry entry = abilityRef.ToEntry();
+            if (entry != null) startingIcon = entry.Icon;
+        }
+        else
+        {
+            BalancingRef<IPassiveAbilityEntry> abilityRef = heroEntry.PassiveAbilityRef;
+            IPassiveAbilityEntry entry = abilityRef.ToEntry();
+            if (entry != null) startingIcon = entry.Icon;
+        }
+        if (!rankIndices.Contains(0) && startingIcon != null)
+            TrackBottomAbilitySlot(slots, 0, heroKey, PlacementSnapshot.StartingAbilityRole, startingIcon);
+
+        List<Sprite> rankIcons = new();
+        foreach (int key in ranks.Keys)
+        {
+            BalancingRef<IRankModifierEntry> rankRef = ranks[key];
+            IRankModifierEntry entry = rankRef.ToEntry();
+            if (entry != null)
+            {
+                if (entry.Icon != null) rankIcons.Add(entry.Icon);
+                TrackBottomAbilitySlot(slots, key - 1, heroKey,
+                    PlacementSnapshot.RankModifierRole(rankRef.Id.ToString()), entry.Icon);
+            }
+        }
+
+        // Specialization cannot be read because its nullable BalancingRef is non-blittable. Accept
+        // only an otherwise unknown visible icon, so a packing collision cannot mark a known part
+        // under the specialization role.
+        if (!rankIndices.Contains(1) && slots.Length > 1)
+        {
+            HeroCardAbilityView abilityView = slots[1];
+            Image icon = abilityView?._abilityIcon;
+            if (abilityView != null && abilityView.gameObject.activeInHierarchy && icon != null &&
+                icon.sprite != null)
+            {
+                bool knownIcon = icon.sprite == startingIcon;
+                for (int i = 0; !knownIcon && i < rankIcons.Count; i++)
+                    knownIcon = icon.sprite == rankIcons[i];
+                if (knownIcon) _abilityMismatches++;
+                else TrackBottomAbilitySlot(slots, 1, heroKey,
+                    PlacementSnapshot.SpecializationRole, icon.sprite);
+            }
+        }
+    }
+
+    private void TrackBottomAbilitySlot(Il2CppReferenceArray<HeroCardAbilityView> slots, int index,
+        string heroKey, string entryKey, Sprite expected)
+    {
+        if (index < 0 || index >= slots.Length) return;
+        HeroCardAbilityView abilityView = slots[index];
+        if (abilityView == null || !abilityView.gameObject.activeInHierarchy) return;
+        Image icon = abilityView._abilityIcon;
+        if (icon == null) return;
+
+        // A packing collision or changed rule must silence this guess, not mark another ability.
+        if (expected == null || icon.sprite != expected) { _abilityMismatches++; return; }
+
+        // Store the semantic role unchanged. The filing side cannot recover an entry id from its
+        // non-blittable nullable origin data, so an entry-id lookup could never match its role key.
+        _tracked.Add(new Tracked(abilityView.transform, abilityView._frameImage, entryKey, heroKey,
+            abilityView.GetInstanceID(), PartKind.Ability));
     }
 
     private void CollectOneCard(HeroRankModifiersView view)
     {
         Il2CppReferenceArray<HeroRankModifiersView.Modifier> slots = view._modifiers;
         if (slots == null || slots.Length == 0) return;
-        // Which Hero's card this is. Walked upward rather than stored, because the view itself is
-        // handed a Hero and keeps none of it.
-        // The result of that walk is kept by native view pointer until Clear, and a destroyed
-        // cached card is walked again so rebuilt pooled UI does not inherit a dead wrapper.
-        HeroCardView card = FindCard(view);
-        var data = card != null ? card._heroData : null;
-        if (data == null) return;
+        // A full card carries the Hero directly, but the placement bar's MiniHeroCard does not.
+        // Its owned equipment slot is the only identity kept inside that card's hierarchy.
+        IReadOnlyHeroData data = ResolveHero(view);
+        if (data == null) { _cardsUnresolved++; return; }
+        _cardsResolved++;
         IntPtr viewKey = view.Pointer;
         EntityId heroId = data.HeroId.ToEntityId();
         if (!_lastHeroIds.TryGetValue(viewKey, out EntityId lastHeroId) ||
@@ -561,14 +928,19 @@ internal sealed class PartGlow
         // assume : a card showing something that is not a full character simply gets no marks.
         ICharacterData hero = data.TryCast<ICharacterData>();
         if (hero == null) return;
+        ICharacterEntry heroEntry = data.HeroRef.ToEntry()?.TryCast<ICharacterEntry>();
+        if (heroEntry == null) return;
 
         int slot = 0;
-        // The active ability first, exactly as SetData packs it.
+        // The active slot can belong to a specialization. Only a Hero that starts active proves this
+        // slot has the starting role; otherwise tracking it would name an indistinguishable ability.
         if (hero.ActiveAbility.HasValue())
         {
             IActiveAbilityEntry active = hero.ActiveAbility.ToEntry();
-            if (active != null)
-                TrackAbilitySlot(slots, ref slot, viewKey, heroKey, hero.ActiveAbility.Id, active.Icon);
+            if (heroEntry.StartWithActiveAbility && active != null)
+                TrackAbilitySlot(slots, ref slot, viewKey, heroKey,
+                    PlacementSnapshot.StartingAbilityRole, active.Icon);
+            else slot++;
         }
 
         // Cast to the concrete collections. The read-only interfaces the game hands out expose an
@@ -577,31 +949,26 @@ internal sealed class PartGlow
         // right way for a guess about someone else's container to fail.
         var passives = hero.PassiveAbilities?
             .TryCast<Il2CppSystem.Collections.Generic.List<BalancingRef<IPassiveAbilityEntry>>>();
-        if (passives != null)
-            for (int i = 0; i < passives.Count; i++)
-            {
-                IPassiveAbilityEntry entry = passives[i].ToEntry();
-                if (entry != null)
-                    TrackAbilitySlot(slots, ref slot, viewKey, heroKey, passives[i].Id, entry.Icon);
-            }
-        else _abilityMismatches++;
+        // PassiveAbilities folds the specialization passive into the starting passives, so none of
+        // them has a provable role. Skip every passive but advance across them; failing to advance
+        // would shift rank roles onto innocent passive icons.
+        if (passives != null) slot += passives.Count;
+        else { _abilityMismatches++; return; }
 
         var ranks = hero.AppliedRankModifiers?
             .TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, BalancingRef<IRankModifierEntry>>>();
         if (ranks != null)
             foreach (BalancingRef<IRankModifierEntry> rankRef in ranks.Values)
             {
-                // The REF's id, not the entry's : that is the one the game stamps on the effects a
-                // rank modifier creates, and the two ends have to agree on the key or the state is
-                // simply never found.
                 IRankModifierEntry entry = rankRef.ToEntry();
-                if (entry != null) TrackAbilitySlot(slots, ref slot, viewKey, heroKey, rankRef.Id, entry.Icon);
+                if (entry != null) TrackAbilitySlot(slots, ref slot, viewKey, heroKey,
+                    PlacementSnapshot.RankModifierRole(rankRef.Id.ToString()), entry.Icon);
             }
         else _abilityMismatches++;
     }
 
     private void TrackAbilitySlot(Il2CppReferenceArray<HeroRankModifiersView.Modifier> slots, ref int slot,
-        IntPtr viewKey, string heroKey, BalancingEntryId entryId, Sprite expected)
+        IntPtr viewKey, string heroKey, string entryKey, Sprite expected)
     {
         if (slot >= slots.Length) return;
         int slotIndex = slot;
@@ -614,21 +981,9 @@ internal sealed class PartGlow
         // what this walk assumes and nothing here can be trusted, so nothing is marked.
         if (expected == null || modifier.Image.sprite != expected) { _abilityMismatches++; return; }
 
-        // NOT memoised, unlike every other id in this file, and the reason is a property of the
-        // type rather than an oversight.
-        //
-        // The hero, item and relic ids are blittable structs wrapping a single guid, so a copy can
-        // be held and compared byte for byte with no interop call. BalancingEntryId is not: it
-        // carries a byte array and a string beside its guid, and the compiler says so outright when
-        // asked to treat it as unmanaged. Comparing its bytes would compare those REFERENCES rather
-        // than what they point at, and every cheaper alternative rests on an assumption about the
-        // generated bindings that has not been verified: whether the proxy carries IEquatable at
-        // all, and whether a boxed value held from one frame to the next stays alive.
-        //
-        // A wrong answer here puts a red mark on an innocent ability, which this feature refuses by
-        // contract. That is not worth trading for a handful of conversions a frame on the one type
-        // where the safe technique does not apply.
-        _tracked.Add(new Tracked(modifier.Container.transform, FindPlate(modifier), entryId.ToString(), heroKey,
+        // Keep the role key verbatim. The filing side's non-blittable nullable entry id became an
+        // all-zero guid, so an entry-id lookup made a correctly blocked filing invisible here.
+        _tracked.Add(new Tracked(modifier.Container.transform, FindPlate(modifier), entryKey, heroKey,
             modifier.Container.GetInstanceID(), PartKind.Ability));
     }
 
@@ -638,19 +993,237 @@ internal sealed class PartGlow
         _lastHeroIds.Clear();
     }
 
-    private HeroCardView FindCard(HeroRankModifiersView view)
+    private IReadOnlyHeroData ResolveHero(HeroRankModifiersView view)
     {
-        IntPtr key = view.Pointer;
-        if (_cardsByAbilityView.TryGetValue(key, out HeroCardView cached))
+        IntPtr key;
+        try { key = view.Pointer; }
+        catch { return null; }
+        if (key == IntPtr.Zero) return null;
+
+        // Read THROUGH the remembered source rather than trusting a remembered answer. Reaching
+        // through a wrapper whose native object the scene destroyed throws, so a dead source drops
+        // out of the cache here and the search runs again.
+        if (_cardsByAbilityView.TryGetValue(key, out HeroCardView cachedCard))
         {
-            if (_abilityViewsWithoutCard.Contains(key)) return null;
-            if (cached != null) return cached;
+            IReadOnlyHeroData hero = HeroOf(cachedCard);
+            if (hero != null) return hero;
+            _cardsByAbilityView.Remove(key);
         }
-        HeroCardView card = view.GetComponentInParent<HeroCardView>();
-        _cardsByAbilityView[key] = card;
-        if (card == null) _abilityViewsWithoutCard.Add(key);
-        else _abilityViewsWithoutCard.Remove(key);
-        return card;
+        if (_ownedSlotByAbilityView.TryGetValue(key, out PlaceholderSlotView cachedSlot))
+        {
+            IReadOnlyHeroData hero = HeroOf(cachedSlot);
+            if (hero != null) return hero;
+            _ownedSlotByAbilityView.Remove(key);
+        }
+
+        HeroCardView card = FindFullCard(view);
+        IReadOnlyHeroData fromCard = HeroOf(card);
+        if (fromCard != null)
+        {
+            _cardsByAbilityView[key] = card;
+            return fromCard;
+        }
+        PlaceholderSlotView slot = FindOwnedSlot(view);
+        IReadOnlyHeroData fromSlot = HeroOf(slot);
+        if (fromSlot != null)
+        {
+            _ownedSlotByAbilityView[key] = slot;
+            return fromSlot;
+        }
+        // Missing is deliberately NOT remembered. A MiniHeroCard is filled in after the scene
+        // appears, and the negative cache this replaced turned that passing state into a card that
+        // stayed unmarked for the rest of the placement.
+        return null;
+    }
+
+    private IReadOnlyHeroData ResolvePanelHero(HeroPanelAbilitiesView view)
+    {
+        IntPtr key;
+        try { key = view.Pointer; }
+        catch { return null; }
+        if (key == IntPtr.Zero) return null;
+
+        if (_cardsByPanelAbilityView.TryGetValue(key, out HeroCardView cachedCard))
+        {
+            IReadOnlyHeroData hero = HeroOf(cachedCard);
+            if (hero != null) return hero;
+            _cardsByPanelAbilityView.Remove(key);
+        }
+
+        HeroCardView card;
+        try { card = view.GetComponentInParent<HeroCardView>(); }
+        catch { return null; }
+        IReadOnlyHeroData fromCard = HeroOf(card);
+        if (fromCard == null) return null;
+        _cardsByPanelAbilityView[key] = card;
+        return fromCard;
+    }
+
+    private IReadOnlyHeroData ResolveBottomHero(HeroCardAbilitiesView view)
+    {
+        IntPtr key;
+        try { key = view.Pointer; }
+        catch { return null; }
+        if (key == IntPtr.Zero) return null;
+
+        // Cache the source, not the answer. A pooled bottom slot can be handed to another Hero.
+        if (_bottomHeroesByAbilityView.TryGetValue(key, out BottomHeroView cachedBottom))
+        {
+            IReadOnlyHeroData hero = HeroOf(cachedBottom);
+            if (hero != null) return hero;
+            _bottomHeroesByAbilityView.Remove(key);
+        }
+        if (_cardsByBottomAbilityView.TryGetValue(key, out HeroCardView cachedCard))
+        {
+            IReadOnlyHeroData hero = HeroOf(cachedCard);
+            if (hero != null) return hero;
+            _cardsByBottomAbilityView.Remove(key);
+        }
+
+        BottomHeroView bottom;
+        try { bottom = view.GetComponentInParent<BottomHeroView>(); }
+        catch { return null; }
+        IReadOnlyHeroData fromBottom = HeroOf(bottom);
+        if (fromBottom != null)
+        {
+            _bottomHeroesByAbilityView[key] = bottom;
+            return fromBottom;
+        }
+
+        HeroCardView card;
+        try { card = view.GetComponentInParent<HeroCardView>(); }
+        catch { return null; }
+        IReadOnlyHeroData fromCard = HeroOf(card);
+        if (fromCard == null) return null;
+        _cardsByBottomAbilityView[key] = card;
+        return fromCard;
+    }
+
+    private static IReadOnlyHeroData HeroOf(HeroCardView card)
+    {
+        try { return card != null ? card._heroData : null; }
+        catch { return null; }
+    }
+
+    private static IReadOnlyHeroData HeroOf(PlaceholderSlotView slot)
+    {
+        try
+        {
+            if (slot == null) return null;
+            if (!NullableRaw.TryReadNullableAt(slot, "<OwnerHeroId>k__BackingField", out HeroId id))
+                return null;
+            return HeroFromRegistry(id);
+        }
+        catch { return null; }
+    }
+
+    private static IReadOnlyHeroData HeroOf(BottomHeroView view)
+    {
+        try
+        {
+            if (view == null) return null;
+            // The getter boxes HeroId?, and an empty bar slot then becomes a null native pointer.
+            if (!NullableRaw.TryReadNullableAt(view, "<HeroId>k__BackingField", out HeroId id))
+                return null;
+            return HeroFromRegistry(id);
+        }
+        catch { return null; }
+    }
+
+    private static HeroCardView FindFullCard(HeroRankModifiersView view)
+    {
+        try { return view.GetComponentInParent<HeroCardView>(); }
+        catch { return null; }
+    }
+
+    // Which Hero a card belongs to when the card is not a full HeroCardView.
+    //
+    // A MiniHeroCard keeps no Hero of its own. What it does keep is the equipment view sitting
+    // beside the ability icons, and the game stamps every equipment slot with its owner
+    // (HeroEquipmentView.UpdateEquipmentSlots -> PlaceholderSlotView.Initialize(index, HeroId)). So
+    // the identity is one level out from the icons and nowhere else inside that hierarchy.
+    //
+    // TWO RULES HOLD THIS UP AND BOTH ARE THE DIFFERENCE BETWEEN A MARK AND A WRONG MARK.
+    //
+    // The climb goes ONE parent at a time and stops the moment an ancestor covers more than one
+    // Hero. The placement bar puts every card under a single shared parent, so a walk that just kept
+    // climbing would eventually find SOMEBODY's slot and mark this card with another Hero's answers.
+    // An ancestor holding two owners is proof the walk has left the card, and nothing at all is the
+    // honest answer there. That also settles a case the game creates by itself: a slot is only built
+    // when `_showEmpty || item.HasValue`, so a Hero carrying no items owns no slot, and this returns
+    // null for them instead of borrowing the neighbour they happen to sit beside.
+    //
+    // The owner is read through NullableRaw and never through the generated getter. HeroId? is a
+    // nullable value type, the getter boxes it first, and boxing an empty one hands back a null
+    // pointer : an unowned slot is the ordinary case here rather than the exception. It is the same
+    // trap the item id further up is read around, for the same reason, and it was walked into again
+    // on the first pass at this method.
+    private static PlaceholderSlotView FindOwnedSlot(HeroRankModifiersView view)
+    {
+        Transform ancestor;
+        try { ancestor = view.transform.parent; }
+        catch { return null; }
+
+        for (int level = 0; level < MaxCardClimb; level++)
+        {
+            try { if (ancestor == null) return null; }
+            catch { return null; }
+
+            PlaceholderSlotView ownerSlot = null;
+            HeroId ownerHeroId = default;
+            bool foundOwner = false;
+            bool ambiguous = false;
+            try
+            {
+                var slots = ancestor.GetComponentsInChildren<PlaceholderSlotView>(true);
+                if (slots != null)
+                    for (int i = 0; i < slots.Length; i++)
+                    {
+                        PlaceholderSlotView slot = slots[i];
+                        if (slot == null) continue;
+                        if (!NullableRaw.TryReadNullableAt(slot, "<OwnerHeroId>k__BackingField",
+                                out HeroId id))
+                            continue;
+                        if (!foundOwner)
+                        {
+                            ownerSlot = slot;
+                            ownerHeroId = id;
+                            foundOwner = true;
+                            continue;
+                        }
+                        // A second, different owner under the same ancestor means this is no longer
+                        // one card. Stop rather than pick whichever came back first.
+                        if (NullableRaw.SameRawId(in ownerHeroId, in id)) continue;
+                        ambiguous = true;
+                        break;
+                    }
+            }
+            catch
+            {
+                // Climbing past an unreadable level could reach the shared bottom-bar parent and
+                // borrow another Hero's slot, which is worse than leaving this card unmarked.
+                return null;
+            }
+
+            if (ambiguous) return null;
+            if (foundOwner) return ownerSlot;
+            try { ancestor = ancestor.parent; }
+            catch { return null; }
+        }
+        return null;
+    }
+
+    private static IReadOnlyHeroData HeroFromRegistry(HeroId heroId)
+    {
+        try
+        {
+            if (!DataReaders.TryGet<GameRegistryDataReader>(out var registry) || registry == null)
+                return null;
+            if (registry.Data == null || registry.Data.Heroes == null) return null;
+            if (!registry.Data.Heroes.TryGetValue(heroId, out HeroData hero) || hero == null) return null;
+            return hero.TryCast<IReadOnlyHeroData>();
+        }
+        catch { return null; }
     }
 
     // The diamond plate behind an ability icon. It is not a field on anything : the view names the
@@ -685,14 +1258,63 @@ internal sealed class PartGlow
         return null;
     }
 
+    private Image FindPanelPlate(HeroPanelAbilityView abilityView, Image icon)
+    {
+        IntPtr key = abilityView.Pointer;
+        if (_platesByContainer.TryGetValue(key, out Image cached))
+        {
+            if (_containersWithoutPlate.Contains(key)) return null;
+            if (cached != null) return cached;
+        }
+        var images = abilityView.GetComponentsInChildren<Image>(true);
+        if (images != null)
+        {
+            for (int i = 0; i < images.Length; i++)
+            {
+                Image candidate = images[i];
+                if (candidate == null || candidate == icon) continue;
+                if (candidate.sprite == null) continue;
+                _platesByContainer[key] = candidate;
+                _containersWithoutPlate.Remove(key);
+                return candidate;
+            }
+        }
+        _platesByContainer[key] = null;
+        _containersWithoutPlate.Add(key);
+        return null;
+    }
+
     private PartState StateOf(Tracked view)
     {
         switch (view.Kind)
         {
             case PartKind.Relic: return _forRelic(view.Id);
-            case PartKind.Ability: return _forAbility != null
-                ? _forAbility(view.OwnerId, view.Id)
-                : PartState.NotPositional;
+            case PartKind.Ability:
+                PartState abilityState = _forAbility != null
+                    ? _forAbility(view.OwnerId, view.Id)
+                    : PartState.NotPositional;
+                // The other end of the key, said once. PositionalGlow prints the key it FILED; this
+                // prints the key being LOOKED UP and what came back. Two lines in one log answer a
+                // question that is otherwise invisible: an icon that is tracked, matched to its
+                // entry, and still never marked looks exactly like an icon whose part is simply
+                // paying, and only the spelling of the key tells them apart.
+                if (!_loggedAbilityLookup && DevLog?.Invoke() == true)
+                {
+                    _loggedAbilityLookup = true;
+                    MelonLogger.Msg($"[TargetingMod] ability state LOOKED UP with key " +
+                                    $"'{PlacementSnapshot.AbilityKey(view.OwnerId, view.Id)}' = {abilityState}");
+                }
+                // And the event that actually matters, said the first time it happens. If this line
+                // appears and no border does, the lookup is fine and the fault is in the drawing;
+                // if it never appears, nothing was ever asking for a mark. Those are two different
+                // repairs and nothing in the log could tell them apart.
+                if (abilityState == PartState.Blocked && !_loggedAbilityBlocked && DevLog?.Invoke() == true)
+                {
+                    _loggedAbilityBlocked = true;
+                    MelonLogger.Msg("[TargetingMod] an ability came back BLOCKED and should now be marked: " +
+                                    PlacementSnapshot.AbilityKey(view.OwnerId, view.Id));
+                }
+                return abilityState;
             default: return _forItem(view.Id);
         }
     }
@@ -725,16 +1347,35 @@ internal sealed class PartGlow
     /// <summary>What this found and what each half cost, for the log at the end of a placement.</summary>
     public string Diagnostic =>
         $"{_tracked.Count} icon(s) read from {_slots.Count} slot(s) and {_abilityViews.Count} hero card(s) " +
-        $"in the scene, {_marks.Count} marked; " +
-        (_abilityMismatches != 0 || _abilityFaults != 0
-            ? $"ABILITY SLOTS SKIPPED: {_abilityMismatches} whose icon did not match the entry the walk " +
-              $"expected, {_abilityFaults} card(s) faulted ({_lastAbilityFault}); "
+        $"and {_panelAbilityViews.Count} placement-bar ability panel(s) and " +
+        $"{_bottomAbilityViews.Count} bottom-bar ability view(s) in the scene, {_marks.Count} marked; " +
+        $"peak this placement: {_peakAbilityIcons} ability icon(s) tracked, off {_peakCardsResolved} " +
+        $"card(s) whose Hero was identified and {_peakCardsUnresolved} that could not be; " +
+        (_peakAbilityMismatches != 0 || _peakAbilityFaults != 0
+            ? $"ability slots skipped, worst pass: {_peakAbilityMismatches} whose icon did not match " +
+              $"the entry the walk expected, {_peakAbilityFaults} card(s) faulted ({_lastAbilityFault}); "
             : "") +
         $"{_searches} scene search(es), worst {_worstSearchMs:F1} ms; " +
         $"{_frames} frame(s), first {_firstFrameMs:F2} ms, worst after that {_worstFrameMs:F2} ms, " +
         $"mean after that {MeanFrameMs:F2} ms; " + MarkArt.Diagnostic;
 
     private double MeanFrameMs => _frames > 1 ? _totalFrameMs / (_frames - 1) : 0;
+
+    /// <summary>How many of the icons being watched are hero abilities rather than items or relics.</summary>
+    /// <remarks>
+    /// Counted at report time off the live list rather than kept as a running total, so it says what
+    /// the LAST pass saw and cannot drift away from the icon count printed beside it.
+    /// </remarks>
+    private int AbilityIconsNow
+    {
+        get
+        {
+            int n = 0;
+            for (int i = 0; i < _tracked.Count; i++)
+                if (_tracked[i].Kind == PartKind.Ability) n++;
+            return n;
+        }
+    }
 
     private void RecordFrame(double ms)
     {
@@ -893,6 +1534,37 @@ internal sealed class PartGlow
             Slash.rectTransform.SetAsLastSibling();
         }
 
+        /// <summary>The frame image's rectangle, expressed in the host's own space.</summary>
+        /// <remarks>
+        /// The strike used to be sized and centred from the HOST, and on an item slot that is right
+        /// because the slot IS the icon. It is not right anywhere else. A bottom-bar ability view's
+        /// rectangle covers the icon AND the description text beside it, so a strike scaled to that
+        /// came out about twice the width of the thing it was striking and hung off the tile.
+        /// Reported on sight, 2026-08-20, the first time an ability was ever successfully marked.
+        ///
+        /// The border never had the fault because it was already placed from this rectangle. Both
+        /// marks now measure the same box, which is the only way they can stay agreeing on surfaces
+        /// nobody has met yet.
+        /// </remarks>
+        private static bool TryFrameRect(RectTransform host, Image frame, out Vector2 size, out Vector2 centre)
+        {
+            size = default;
+            centre = default;
+            if (frame == null || host == null) return false;
+            try
+            {
+                RectTransform source = frame.rectTransform;
+                Rect r = source.rect;
+                if (r.width <= 0f || r.height <= 0f) return false;
+                Vector3 min = host.InverseTransformPoint(source.TransformPoint(new Vector3(r.xMin, r.yMin, 0f)));
+                Vector3 max = host.InverseTransformPoint(source.TransformPoint(new Vector3(r.xMax, r.yMax, 0f)));
+                size = new Vector2(Mathf.Abs(max.x - min.x), Mathf.Abs(max.y - min.y));
+                centre = new Vector2((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f) - host.rect.center;
+                return size.x > 0f && size.y > 0f;
+            }
+            catch { return false; }
+        }
+
         public void Apply(RectTransform hostRect, Image frame, Sprite fallback)
         {
             Rect rect = hostRect.rect;
@@ -938,13 +1610,22 @@ internal sealed class PartGlow
 
             if (sized)
             {
+                // Measured off the FRAME, falling back to the host only where there is no frame to
+                // measure. See TryFrameRect for what the host measured instead.
+                Vector2 markSize = rect.size;
+                Vector2 markCentre = Vector2.zero;
+                if (TryFrameRect(hostRect, frame, out Vector2 frameSize, out Vector2 frameCentre))
+                {
+                    markSize = frameSize;
+                    markCentre = frameCentre;
+                }
                 RectTransform slash = Slash.rectTransform;
                 slash.anchorMin = Center;
                 slash.anchorMax = Center;
                 slash.pivot = Center;
-                slash.anchoredPosition = Vector2.zero;
-                slash.sizeDelta = new Vector2(rect.width * SlashLengthFactor,
-                    Mathf.Max(SlashMinThickness, rect.width * SlashThicknessFactor));
+                slash.anchoredPosition = markCentre;
+                slash.sizeDelta = new Vector2(markSize.x * SlashLengthFactor,
+                    Mathf.Max(SlashMinThickness, markSize.x * SlashThicknessFactor));
                 // Down to the right, the way a "not this" stroke is drawn everywhere else.
                 //
                 // A rotated quad, where the reference renderer had to build a polygon. That is not

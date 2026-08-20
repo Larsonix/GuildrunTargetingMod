@@ -7,6 +7,7 @@ using Il2CppInterop.Runtime;
 using Il2CppTMPro;
 using Il2Cppgg.leyline.core.Mvcs.Model;
 using MelonLoader;
+using MelonLoader.Utils;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.Localization.Components;
@@ -20,6 +21,14 @@ internal sealed class MenuUI
 {
     private readonly Capabilities _capabilities;
     private readonly IModSwitch _modSwitch;
+    // Null when the check never ran. Everything below treats that as "nothing to say", which is the
+    // same branch a machine with no internet takes.
+    private readonly UpdateCheck _updates;
+    private readonly MelonPreferences_Entry<string> _lastUpdateSeen;
+    private readonly string _currentVersion;
+    private Il2CppSystem.Action _updateAction;
+    private string _pendingUpdateVersion;
+    private string _pendingUpdateUrl;
     // The single boolean Tick reads before anything else. Everything below exists to keep this
     // false for the whole of a battle, because the mod being switched off has to cost nothing and
     // a menu button that polls during a fight would be exactly the cost it promises not to have.
@@ -76,12 +85,25 @@ internal sealed class MenuUI
     private static string UnavailableTitle => "Targeting Mod";
     private static string UnavailableBody => "The mod has switched itself off because the game has changed and it can no longer guarantee the leaderboard and win-streak rule. Check for a mod update.";
 
+    // No button is named here. The dialog is the game's own and its buttons carry the game's words,
+    // which are Cancel and OK, so a body written around "press OK" would be describing a label this
+    // mod does not own and cannot keep. It says what happens instead.
+    private static string UpdateTitle(string version) => "Targeting Mod " + version + " is available";
+    private static string UpdateBody(string current) =>
+        "Your current version = " + current +
+        "\n\nTo update : Download the mod-only .zip and drop its content into your game folder." +
+        "\n\nAccepting opens the download and your game folder.";
+
     public string Diagnostic { get; private set; } = "unresolved";
 
-    public MenuUI(Capabilities capabilities, IModSwitch modSwitch)
+    public MenuUI(Capabilities capabilities, IModSwitch modSwitch, UpdateCheck updates,
+        MelonPreferences_Entry<string> lastUpdateSeen, string currentVersion)
     {
         _capabilities = capabilities;
         _modSwitch = modSwitch;
+        _updates = updates;
+        _lastUpdateSeen = lastUpdateSeen;
+        _currentVersion = currentVersion;
     }
 
     /// <summary>
@@ -340,6 +362,7 @@ internal sealed class MenuUI
             RefreshLabel();
             TryNoteMainMenuState();
             TryShowNotice();
+            TryShowUpdateNotice();
             _nextRefreshAt = now + RefreshSeconds;
         }
         catch (Exception e)
@@ -461,6 +484,98 @@ internal sealed class MenuUI
         MelonLogger.Msg("[TargetingMod] the leaderboard notice was shown, once, and will not be shown again");
     }
 
+    // Shown once per version that is newer than this build, then never again for that version.
+    // Dismissing means dismissed : the mark is written when the dialog is SHOWN rather than when it
+    // is answered, so a player who closes the game on top of it is not asked twice for the same
+    // release either.
+    private void TryShowUpdateNotice()
+    {
+        if (_updates == null || _lastUpdateSeen == null) return;
+        // The leaderboard notice outranks this one and is allowed to finish first. It is said once
+        // per install and it is the one that explains why a score did not appear, whereas an update
+        // keeps perfectly well until the next trip to the menu. Two modals in one frame is also the
+        // case the game logs its own error for.
+        if (_noticeAttemptsLeft > 0) return;
+        // The same wait the notice takes, and for the same reason : the first menu of a session is
+        // when the game plays its intro and may raise a survey or a privacy dialog of its own.
+        if (Time.realtimeSinceStartup < _noticeReadyAt) return;
+
+        if (_pendingUpdateVersion == null)
+        {
+            UpdateCheck.Result found = _updates.TryTakeResult();
+            if (found == null) return;
+            // Asked here rather than in the check, so that every preference WRITE in this feature
+            // happens on Unity's thread. Saving is file work and the check runs on a pool thread.
+            if (string.Equals(found.Version, _lastUpdateSeen.Value, StringComparison.Ordinal))
+            {
+                MelonLogger.Msg("[TargetingMod] update check: " + found.Version +
+                                " has already been offered once, so nothing is shown");
+                return;
+            }
+            _pendingUpdateVersion = found.Version;
+            _pendingUpdateUrl = found.DownloadUrl;
+        }
+
+        // Held rather than dropped when a dialog is already open, because unlike the notice this one
+        // has no attempt budget to burn : it simply waits for the next tick, and the next menu after
+        // that, until it is genuinely shown.
+        if (!DialogIsClosed()) return;
+
+        _updateAction ??= DelegateSupport.ConvertDelegate<Il2CppSystem.Action>(OnUpdateAccepted);
+        DialogPanel.ShowConfirmationDialog(UpdateTitle(_pendingUpdateVersion),
+            UpdateBody(_currentVersion), _updateAction);
+        _lastUpdateSeen.Value = _pendingUpdateVersion;
+        MelonPreferences.Save();
+        // Said out loud for the same reason the leaderboard notice is : a preference changing value
+        // cannot tell "it was shown" from "it was skipped for a reason nobody wrote down".
+        MelonLogger.Msg("[TargetingMod] the update notice for " + _pendingUpdateVersion +
+                        " was shown, once, and will not be shown again for that version");
+        _pendingUpdateVersion = null;
+    }
+
+    // Opens the download, and the folder it has to end up in. Two separate attempts on purpose : a
+    // file manager that does not open must not cost the player the download, which is the half that
+    // matters and the half that works everywhere.
+    private void OnUpdateAccepted()
+    {
+        string url = _pendingUpdateUrl;
+        // The folder first, so the browser is the window left in front. The download is the thing
+        // the player needs to watch ; the folder is where they will drop it afterwards.
+        OpenGameFolder();
+        try
+        {
+            if (!string.IsNullOrEmpty(url)) Application.OpenURL(url);
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[TargetingMod] the download could not be opened: " + e.Message);
+        }
+    }
+
+    // The game folder, as a file URL rather than a path, because a Windows path carries spaces and
+    // brackets that only survive being escaped. Uri does that correctly and a hand-built string
+    // does not.
+    //
+    // The game ships Windows only and runs on Linux and the Steam Deck through Proton, so this is
+    // always a Windows path, sometimes inside a Wine prefix. Inside one there may be no file manager
+    // associated at all and nothing will open. That is why the path is logged and why the dialog
+    // already says where the file has to go : the instruction stands on its own, and this is a
+    // shortcut on top of it rather than the way it is delivered.
+    private void OpenGameFolder()
+    {
+        try
+        {
+            string folder = MelonEnvironment.GameRootDirectory;
+            if (string.IsNullOrEmpty(folder)) return;
+            MelonLogger.Msg("[TargetingMod] update: the game folder is " + folder);
+            Application.OpenURL(new Uri(folder).AbsoluteUri);
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[TargetingMod] the game folder could not be opened: " + e.Message);
+        }
+    }
+
     // Finding the panel walks every loaded object, so it is found once and kept. Whether it is
     // OPEN is then a field read, which is what makes it affordable to ask on a timer.
     //
@@ -486,7 +601,7 @@ internal sealed class MenuUI
         }
     }
 
-    // Its own capability, not the placement one. Losing the menu button must not blank the three
+    // Its own capability, not the placement one. Losing the menu button must not blank the four
     // buttons in battle, and a battle button that threw must not cost the player the only way to
     // switch the mod back on.
     private void DisableFeature(string reason)
@@ -523,6 +638,10 @@ internal sealed class MenuUI
         _labels = null;
         _clickAction = null;
         _confirmationAction = null;
+        // Rebuilt lazily on the next menu, like the two above. The PENDING update is deliberately
+        // NOT cleared here : a notice that could not be shown because a dialog was already up has
+        // to survive a trip into a run and be shown on the way back, or it is lost for that version.
+        _updateAction = null;
         _dialog = null;
         _persistence = null;
         _noticeReadyAt = 0f;

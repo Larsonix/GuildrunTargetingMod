@@ -2,10 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Il2CppEmber.Balancing;
 using Il2CppEmber.Balancing.SimulationBridge;
 using Il2CppEmber.Balancing.SimulationBridge.Context;
 using Il2CppEmber.Balancing.SimulationBridge.Effects;
 using Il2CppEmber.Balancing.SimulationBridge.Effects.Conditions;
+using Il2CppEmber.Balancing.Sheets.Abilities.ActiveAbilities;
+using Il2CppEmber.Balancing.Sheets.Abilities.PassiveAbilities;
+using Il2CppEmber.Balancing.Sheets.Characters;
+using Il2CppEmber.Balancing.Sheets.Characters.Specializations;
+using Il2CppEmber.Balancing.Sheets.RankModifiers;
 using Il2CppEmber.Scopes.GameRun.GameRegistry.Data.Characters;
 using Il2CppEmber.Simulation.Core.Bridge;
 using Il2CppEmber.Simulation.Core.State;
@@ -77,6 +83,26 @@ internal sealed class PlacementSnapshot
     public PartState ForRelic(string id) => Lookup(_byRelic, id);
     public PartState ForAbility(string id) => Lookup(_byAbility, id);
 
+    /// <summary>
+    /// The role words both halves of this feature use in place of an entry id they cannot both read.
+    /// </summary>
+    /// <remarks>
+    /// A Hero-owned part is named by WHERE IT CAME FROM rather than by which entry it is: the
+    /// starting ability, the specialization, or a particular rank modifier. Two of those three are
+    /// pure roles with no id at all.
+    ///
+    /// That is not a shortcut, it is the only scheme that works. Naming the specialization requires
+    /// reading `Specialization`, a nullable of a BalancingRef whose id carries a byte array and a
+    /// string, so it is not blittable and cannot cross the interop boundary by any route. A rank
+    /// modifier CAN be named, because its ref arrives as a plain dictionary key rather than inside a
+    /// nullable, so that one keeps its id and stays distinguishable from its siblings.
+    ///
+    /// Spelled here, once, so the two ends cannot drift apart.
+    /// </remarks>
+    public const string StartingAbilityRole = "start";
+    public const string SpecializationRole = "spec";
+    public static string RankModifierRole(string entryId) => "rank/" + entryId;
+
     /// <summary>The one place the hero-and-entry key is spelled, so both ends cannot drift apart.</summary>
     public static string AbilityKey(string heroKey, string entryKey) =>
         string.IsNullOrEmpty(heroKey) || string.IsNullOrEmpty(entryKey) ? null : heroKey + "/" + entryKey;
@@ -129,6 +155,23 @@ internal sealed class PlacementSnapshot
         return true;
     }
 
+    /// <summary>Every ability key this snapshot holds, with its state, for the log.</summary>
+    /// <remarks>
+    /// The WHOLE set, not a sample. The one-shot "first key filed" line this replaces fired on the
+    /// first refresh of a session, which is the opening battle of a run and has nothing
+    /// placement-dependent in it, so it reported an empty board and never spoke again. A sampled
+    /// instrument answers about the moment it happened to fire rather than the moment being asked
+    /// about, and there are at most a handful of these.
+    /// </remarks>
+    public string DescribeAbilities()
+    {
+        if (_byAbility.Count == 0) return "none";
+        var parts = new List<string>(_byAbility.Count);
+        foreach (KeyValuePair<string, PartState> pair in _byAbility) parts.Add(pair.Key + "=" + pair.Value);
+        parts.Sort(StringComparer.Ordinal);
+        return string.Join(" | ", parts);
+    }
+
     private static PartState Lookup(Dictionary<string, PartState> from, string id) =>
         id != null && from.TryGetValue(id, out PartState state) ? state : PartState.NotPositional;
 
@@ -169,6 +212,10 @@ internal sealed class PositionalGlow
     // A frame at sixty per second is about sixteen milliseconds, so three is a fifth of one. Below
     // that this is not the thing anyone would feel.
     private const double SlowRefreshMs = 3.0;
+    // The longest the marks may stand without being recomputed while the board looks unchanged.
+    // A quarter of a second is under the threshold at which a stale mark reads as wrong, and it is
+    // what catches the changes occupancy cannot see, such as an item moved between two Heroes.
+    private const float UnchangedRefreshSeconds = 0.25f;
 
     // Conditions that depend on where units stand AND that the game is willing to judge outside a
     // battle. Both halves matter.
@@ -219,6 +266,40 @@ internal sealed class PositionalGlow
         "IsOwnerOrDirectlyInFrontOfOwnerCondition"
     };
 
+    // The subset of the list above whose answer depends on WHO is being asked about, and not only on
+    // where the owner is standing. Classified from the game's own condition bodies rather than from
+    // their names: every one of these reads BOTH the target and the owner, so what it really asks is
+    // "is SOMEBODY ELSE in this relation to the owner".
+    //
+    // ASKING ONE OF THESE ABOUT THE OWNER IS NOT A SLIGHTLY WRONG QUESTION. IT IS A QUESTION WITH A
+    // CONSTANT ANSWER, and that is what this list exists to stop.
+    //
+    // IsInFrontOfOwner and IsBehindOwner open with `if (targetId == owner.Id) return false;`, so Sal's
+    // The Lover and Pimenta's The Lover reported "not paying" on every board ever drawn and no
+    // placement could ever clear it. IsAdjacentToOwner needs no special case to be just as constant:
+    // the distance from a Hero to itself is zero and the test is "== 1". The two that fail the other
+    // way are worse for being invisible, IsOwnerOrAdjacentToOwner and IsInRangeOfOwner both answer
+    // true for the owner by construction, so the fourteen entries carrying them could never report
+    // anything at all and the feature looked like it simply had nothing to say about them.
+    //
+    // Note what is NOT here. IsOwnerInBackRow and IsOwnerAdjacentToExactlyOneAlly ignore the target
+    // entirely and read the owner's own hex, which is why those have always worked. And the whole
+    // IsEffectTarget family is left out on purpose: those ask where ONE named Hero is standing, with
+    // no reference to an owner, so asking about the wearer of an item is exactly right and asking
+    // about the board at large would light Sentinel's Plate for a row its wearer is not in.
+    private static readonly HashSet<string> RelationalConditions = new(StringComparer.Ordinal)
+    {
+        "IsAdjacentToOwnerCondition",
+        "IsBehindOwnerCondition",
+        "IsEffectTargetInSameRowAsOwnerCondition",
+        "IsInFrontOfOwnerCondition",
+        "IsInRangeOfOwnerCondition",
+        "IsOnlyAllyInFrontOfOwnerCondition",
+        "IsOwnerOrAdjacentToOwnerCondition",
+        "IsOwnerOrDirectlyInFrontOfOwnerCondition",
+        "IsOwnerOrOnlyAllyInFrontOfOwnerCondition"
+    };
+
     private readonly Capabilities _capabilities;
     private PlacementSnapshot _live = new();
     private PlacementSnapshot _spare = new();
@@ -240,6 +321,11 @@ internal sealed class PositionalGlow
     // answer, which is a mark that is silently wrong rather than merely late. The per-frame cost
     // this would have saved is removed properly by refreshing on board change instead of on frame.
     private readonly Dictionary<string, bool> _positionalByEffect = new(StringComparer.Ordinal);
+    // Whether an effect must be judged against the board rather than against its owner. Authored
+    // data like the line above, cached the same way and for the same reason, and keyed by ID for the
+    // same reason again : an effect object freed when an item is unequipped must not hand its answer
+    // to whatever lands on that address next.
+    private readonly Dictionary<string, bool> _relationalByEffect = new(StringComparer.Ordinal);
     // Effects the game's own condition code refuses to judge. Measured in play : one entry on one
     // board threw out of IsTargetConditionMet, and without this it would throw again on every
     // check for the rest of the placement.
@@ -258,10 +344,16 @@ internal sealed class PositionalGlow
     private bool _loggedSlowRefresh;
     private int _refreshes;
     private int _skipped;
+    // Frames where the board had not moved and the floor had not expired, so nothing was read.
+    private int _skippedUnchanged;
+    private ulong _lastSignature;
+    private bool _signatureSeen;
+    private float _nextForcedRefreshAt;
     private double _firstRefreshMs;
     private double _worstAfterFirstMs;
     private double _totalAfterFirstMs;
     private bool _loggedEffectFault;
+    private bool _loggedAbilityKey;
     private bool _loggedPreviewResult;
     // Every distinct condition class the run actually contains, gathered until the first result
     // is reported. If nothing matches the allowlist, this is what says whether the names are
@@ -270,6 +362,19 @@ internal sealed class PositionalGlow
     private static readonly Dictionary<IntPtr, bool> AllowlistedConditionClasses = new();
 
     public PositionalGlow(Capabilities capabilities) => _capabilities = capabilities;
+
+    /// <summary>
+    /// The player's verbose-log switch. The key trace below is diagnostic scaffolding, not something
+    /// a player needs in their log, and it stays behind this.
+    /// </summary>
+    /// <remarks>
+    /// Kept rather than deleted after it served its purpose. Those two lines, one from each half of
+    /// this feature, are what ended a hunt that five careful source reads had each got wrong: when
+    /// two components must agree on a composed key, the only cheap way to see a disagreement is to
+    /// print both spellings. The next time they drift this is the tool, and rebuilding it from
+    /// scratch under pressure is how a lesson gets paid for twice.
+    /// </remarks>
+    public Func<bool> DevLog { get; set; }
 
     /// <summary>
     /// The board the player is about to make, or null when they are not making one. Set from the
@@ -346,9 +451,20 @@ internal sealed class PositionalGlow
     /// separately from the rest, or the number cannot answer the question it was taken to answer.
     /// </remarks>
     public string Diagnostic =>
+        // The POPULATION first, because the timings were all this reported and the population is the
+        // question anybody actually brings to this log. It was written once per session by
+        // LogFirstResult, at the first refresh, which on every shipped log is the opening battle of a
+        // run : no items, no specializations, no rank modifiers. So every log this mod has ever
+        // produced says "0 hero(es), 0 item(s)" and none of them meant it. Printed per placement, it
+        // says what THAT board held.
+        $"{_live.Heroes} hero(es), {_live.Items} item(s), {_live.Relics} relic(s), " +
+        $"{_live.Abilities} ability/rank-modifier(s) placement-dependent on this board; " +
+        $"{_live.Positional} positional of {_live.Scanned} scanned, {_live.Unreadable} unreadable, " +
+        $"{_live.UnattributedAbilities} hero-owned effect(s) not traced to their entry; " +
         $"{_refreshes} refresh(es), first {_firstRefreshMs:F2} ms, " +
         $"worst after that {_worstAfterFirstMs:F2} ms, mean after that {MeanAfterFirstMs:F2} ms; " +
-        $"{_skipped} frame(s) not read because a drag preview was answering";
+        $"{_skipped} frame(s) not read because a drag preview was answering, " +
+        $"{_skippedUnchanged} not read because nobody had moved";
 
     private double MeanAfterFirstMs => _refreshes > 1 ? _totalAfterFirstMs / (_refreshes - 1) : 0;
 
@@ -370,10 +486,35 @@ internal sealed class PositionalGlow
     /// averaging over frames that did no work would quietly halve the very number this exists to
     /// report, and the point of the number is to be comparable.
     /// </remarks>
-    public void Update(bool liveNeeded)
+    public void Update(bool liveNeeded, ulong boardSignature)
     {
         if (!_capabilities.PositionalGlow) return;
         if (!liveNeeded) { _skipped++; return; }
+        // THE ANSWER ONLY CHANGES WHEN THE BOARD DOES, SO STOP RECOMPUTING IT SIXTY TIMES A SECOND.
+        //
+        // This walked every fielded Hero, every equipped item and every owned relic on EVERY frame,
+        // evaluating the game's own condition code for each positional effect. Measured in play
+        // 2026-08-20: a mean of 0.12 ms but a worst of 8.82 ms on a settled frame, which tripped the
+        // mod's own slow-frame warning. The cost also grew when relational conditions started being
+        // asked of every Hero rather than one, which is correct and is not free.
+        //
+        // None of that work can produce a different answer while nobody has moved. The occupancy
+        // signature the drag tracker already computes says exactly that, and it costs nothing
+        // because that walk happens anyway.
+        //
+        // The floor is what keeps this honest. Occupancy does NOT see an item moved between two
+        // Heroes, so anything the cheap test cannot notice is corrected within a quarter of a
+        // second. Same shape as the hover raycast's own floor and the area scan's interval, and the
+        // same reasoning: a cheap test may be less than exhaustive only when something bounded
+        // catches what it misses.
+        float now;
+        try { now = UnityEngine.Time.realtimeSinceStartup; }
+        catch { now = 0f; }
+        bool boardMoved = !_signatureSeen || boardSignature != _lastSignature;
+        if (!boardMoved && now < _nextForcedRefreshAt) { _skippedUnchanged++; return; }
+        _lastSignature = boardSignature;
+        _signatureSeen = true;
+        _nextForcedRefreshAt = now + UnchangedRefreshSeconds;
         long start = Stopwatch.GetTimestamp();
         Refresh();
         double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
@@ -413,12 +554,17 @@ internal sealed class PositionalGlow
         _effectIdStrings.Clear();
         _lastEffectIds.Clear();
         _positionalByEffect.Clear();
+        _relationalByEffect.Clear();
         _unreadable.Clear();
         SeenConditionNames.Clear();
         _tooltipController = null; // belongs to the battle scene that is being taken apart.
         _tooltipControllerSearch.Reset();
         _refreshes = 0;
         _skipped = 0;
+        _skippedUnchanged = 0;
+        _signatureSeen = false;
+        _lastSignature = 0UL;
+        _nextForcedRefreshAt = 0f;
         _firstRefreshMs = 0;
         _worstAfterFirstMs = 0;
         _totalAfterFirstMs = 0;
@@ -442,6 +588,64 @@ internal sealed class PositionalGlow
         bool positional = IsPositional(modular.Condition);
         _positionalByEffect[key] = positional;
         return positional;
+    }
+
+    private bool IsRelationalCached(EffectId effectId, ModularEffect modular)
+    {
+        string key = EffectKey(modular.Pointer, effectId);
+        if (_relationalByEffect.TryGetValue(key, out bool known)) return known;
+        bool relational = HasRelational(modular.Condition);
+        _relationalByEffect[key] = relational;
+        return relational;
+    }
+
+    // Does this effect's condition tree contain anything that has to be judged against the board.
+    // Walked exactly like IsPositional, including reading a compound through its backing array
+    // rather than the interface list, which is a known way to bring the process down.
+    private static bool HasRelational(IEffectCondition condition)
+    {
+        if (condition == null) return false;
+        try
+        {
+            CompoundCondition compound = condition.TryCast<CompoundCondition>();
+            if (compound != null)
+            {
+                var inner = NullableRaw.ReadReferenceArrayAt<IEffectCondition>(compound, "_conditions");
+                if (inner == null) return false;
+                for (int i = 0; i < inner.Length; i++)
+                    if (HasRelational(inner[i])) return true;
+                return false;
+            }
+            return RelationalConditions.Contains(RuntimeDiscovery.NativeClassName(condition));
+        }
+        catch
+        {
+            // Unclassifiable means "judge it the way it was judged before", which is the behaviour
+            // that has shipped for four versions rather than a new guess.
+            return false;
+        }
+    }
+
+    // Whether ANY Hero on the board satisfies this effect, asked one Hero at a time.
+    //
+    // Per EFFECT and never per condition, and that is the part worth stating. A compound has to be
+    // judged against ONE Hero at a time or a rule reading "in front of the owner AND in the front
+    // row" would be answered about two different people and reported as a single fact. Asking each
+    // Hero the whole question and taking the best answer is the only form that cannot do that.
+    //
+    // The same walk EvaluateRelic already makes, deliberately left as a second copy rather than
+    // shared with it : a relic asks this because it HAS no owner, and this asks it because the owner
+    // is the wrong Hero to ask about. Same shape, different reasons, and folding them together would
+    // hide that a change to one is not automatically right for the other.
+    private static bool MeetsForAnyHero(ModularEffect modular, IBattleContextReader reader,
+        IBattleContextWriter writer, GameRegistryDataReader registry)
+    {
+        foreach (HeroData hero in registry.Data.Heroes.Values)
+        {
+            if (hero == null || registry.IsHeroInReserve(hero.HeroId)) continue;
+            if (MeetsFor(modular, reader, writer, hero.HeroId.ToEntityId())) return true;
+        }
+        return false;
     }
 
     private string HeroKey(IntPtr owner, EntityId id)
@@ -651,8 +855,11 @@ internal sealed class PositionalGlow
                 if (hero == null || registry.IsHeroInReserve(hero.HeroId)) continue;
                 EntityId target = hero.HeroId.ToEntityId();
                 string heroKey = HeroKey(hero.Pointer, target);
-                EvaluateOwned(data.EffectsByHero, hero.HeroId, target, heroKey, null, reader, writer, effects, registry, snapshot);
-                EvaluateOwned(data.EffectsByHeroSpecialization, hero.HeroId, target, heroKey, null, reader, writer, effects, registry, snapshot);
+                Dictionary<string, string> abilityEntries = AbilityEntriesFor(data, hero);
+                EvaluateOwned(data.EffectsByHero, hero.HeroId, target, heroKey, null,
+                    reader, writer, effects, registry, snapshot, abilityEntries);
+                EvaluateOwned(data.EffectsByHeroSpecialization, hero.HeroId, target, heroKey, null,
+                    reader, writer, effects, registry, snapshot, abilityEntries);
             }
             catch (Exception e) { SkipOwner(snapshot, e); }
         }
@@ -688,11 +895,108 @@ internal sealed class PositionalGlow
         return snapshot;
     }
 
+    // Names hero-owned effects from the game's indexes, whose keys carry the same balancing refs
+    // the icon layer reads. The effect's OriginEntryId cannot be used here: BalancingEntryId is not
+    // blittable, so the generated nullable getter returns its default value and files every effect
+    // under the empty id.
+    private static Dictionary<string, string> AbilityEntriesFor(EffectsData data, HeroData heroData)
+    {
+        var entries = new Dictionary<string, string>(StringComparer.Ordinal);
+        bool rankModifiersMapped = MapRankModifiers(data, heroData.HeroId, entries);
+        try { MapSpecialization(data, heroData, entries); }
+        catch { /* Attribution must never cost the Hero tile its already-correct answer. */ }
+
+        // EffectsByHero double-files rank modifiers with the starting ability. Without a complete
+        // rank-modifier exclusion, attributing its leftovers would put a blocked rank modifier on
+        // the starting ability's innocent icon. Keep evaluating those effects for MergeHero, but
+        // leave their ability entries unattributed if the tuple-keyed index could not be walked.
+        if (rankModifiersMapped)
+        {
+            try { MapStartingAbility(data, heroData, entries); }
+            catch { /* Leave the effect unattributed instead of skipping its Hero evaluation. */ }
+        }
+        return entries;
+    }
+
+    private static bool MapRankModifiers(EffectsData data, HeroId heroId,
+        Dictionary<string, string> entries)
+    {
+        try
+        {
+            var rankEffects = data.RankModifierEffects;
+            if (rankEffects == null) return false;
+            foreach (var rankKey in rankEffects.Keys)
+            {
+                if (rankKey == null) continue;
+                HeroId indexedHero = rankKey.Item1;
+                if (!NullableRaw.SameRawId(in indexedHero, in heroId)) continue;
+                BalancingRef<IRankModifierEntry> rankRef = rankKey.Item2;
+                if (rankRef == null) continue;
+                var ids = rankEffects[rankKey];
+                if (ids == null) continue;
+                string entryKey = PlacementSnapshot.RankModifierRole(rankRef.Id.ToString());
+                for (int i = 0; i < ids.Count; i++)
+                    entries[ids[i].ToString()] = entryKey;
+            }
+            return true;
+        }
+        catch
+        {
+            // A partial walk is not enough to distinguish leftovers in EffectsByHero. Remove it so
+            // the caller cannot mistake an unseen rank modifier for the starting ability.
+            entries.Clear();
+            return false;
+        }
+    }
+
+    private static void MapSpecialization(EffectsData data, HeroData heroData,
+        Dictionary<string, string> entries)
+    {
+        // THE SPECIALIZATION IS NAMED BY ITS ROLE AND NEVER BY ITS ENTRY, BECAUSE ITS ENTRY CANNOT
+        // BE READ AT ALL.
+        //
+        // `IHeroTagsSource.Specialization` is a nullable of BalancingRef, and BalancingRef carries a
+        // BalancingEntryId, which carries a byte array and a string. That is not blittable, so there
+        // is no way across the interop boundary: the generated getter throws while constructing the
+        // value, and a raw offset read cannot rebuild a struct made of references either. This is the
+        // third field of that exact family to defeat this feature, after the effect's OriginEntryId
+        // and the bar slot's owner id.
+        //
+        // It does not need to be read. Being IN this index already says which part the effect came
+        // from, and the icon layer can work out which of its slots is the specialization from the
+        // rank modifiers alone, which ARE readable. So both ends agree on the word "spec" and neither
+        // one has to name the entry.
+        if (!data.EffectsByHeroSpecialization.ContainsKey(heroData.HeroId)) return;
+        var ids = data.EffectsByHeroSpecialization[heroData.HeroId];
+        if (ids == null) return;
+        for (int i = 0; i < ids.Count; i++)
+            entries[ids[i].ToString()] = PlacementSnapshot.SpecializationRole;
+    }
+
+    private static void MapStartingAbility(EffectsData data, HeroData heroData,
+        Dictionary<string, string> entries)
+    {
+        if (!data.EffectsByHero.ContainsKey(heroData.HeroId)) return;
+        ICharacterEntry heroEntry = heroData.HeroRef.ToEntry()?.TryCast<ICharacterEntry>();
+        if (heroEntry == null) return;
+        // The starting ability is a role too. Its entry IS readable, unlike the specialization's,
+        // but naming it by id would leave one of the three hero-owned parts spelled differently from
+        // the other two, and one scheme with an exception in it is two schemes.
+        string entryKey = PlacementSnapshot.StartingAbilityRole;
+        var ids = data.EffectsByHero[heroData.HeroId];
+        if (ids == null) return;
+        for (int i = 0; i < ids.Count; i++)
+        {
+            string effectKey = ids[i].ToString();
+            if (!entries.ContainsKey(effectKey)) entries[effectKey] = entryKey;
+        }
+    }
+
     private void EvaluateOwned<TKey>(Il2CppSystem.Collections.Generic.Dictionary<TKey, Il2CppSystem.Collections.Generic.List<EffectId>> index,
         TKey key, EntityId target, string heroKey, string itemKey,
         IBattleContextReader reader, IBattleContextWriter writer, EffectsReader effects,
         GameRegistryDataReader registry,
-        PlacementSnapshot snapshot)
+        PlacementSnapshot snapshot, Dictionary<string, string> abilityEntries = null)
     {
         // Asked before it is indexed. Most Heroes own no effects of a given kind at all, and a
         // Hero with no specialization has no entry in that index whatsoever, so reaching straight
@@ -708,20 +1012,43 @@ internal sealed class PositionalGlow
             try
             {
                 snapshot.Positional++;
-                PartState state = MeetsFor(modular, reader, writer, target) ? PartState.Live : PartState.Blocked;
+                // Who to ask about. An effect whose rule is about where its OWNER stands is asked
+                // about that owner, which is what this has always done and is right for an item : an
+                // item's rule is about the Hero wearing it and nobody else. An effect whose rule is
+                // about somebody else's position RELATIVE to the owner cannot be answered that way at
+                // all, because the owner is never in front of, behind, or one hex from itself. See
+                // RelationalConditions for what that cost.
+                bool met = IsRelationalCached(ids[i], modular)
+                    ? MeetsForAnyHero(modular, reader, writer, registry)
+                    : MeetsFor(modular, reader, writer, target);
+                PartState state = met ? PartState.Live : PartState.Blocked;
                 snapshot.MergeHero(heroKey, state);
                 if (itemKey != null) { snapshot.MergeItem(itemKey, state); continue; }
                 // Hero-owned, so it came from a rank modifier, a passive, or the specialization.
-                // Which one is stamped on the effect itself, so the answer can name the entry
-                // instead of only the Hero. An effect that cannot be traced back is COUNTED rather
-                // than guessed at : the tile under the Hero still says something is switched off,
-                // and no icon is told a story about itself that might not be true.
+                // The per-Hero map names it from the game's indexes. An effect those indexes cannot
+                // name is COUNTED rather than guessed at: the tile under the Hero still says
+                // something is switched off, and no icon is told a story that might not be true.
                 // Keyed by the HERO AND the entry, never the entry alone. Two Heroes can carry the
                 // same rank modifier in opposite states, and a key that named only the modifier
                 // would merge them : one Hero out of position would put the mark on everybody
                 // else's copy of it too, which is the feature telling a story that is not true.
-                if (TryAbilityKey(ids[i], effects, target, heroKey, out string abilityKey))
+                if (abilityEntries != null &&
+                    abilityEntries.TryGetValue(ids[i].ToString(), out string entryKey))
+                {
+                    string abilityKey = PlacementSnapshot.AbilityKey(heroKey, entryKey);
                     snapshot.MergeAbility(abilityKey, state);
+                    // Said once, with the key EXACTLY as it is filed. The icon half composes the same
+                    // key from the other end, off the ability ref the card is showing, and if the two
+                    // spellings differ by so much as a prefix the lookup silently answers "nothing to
+                    // say" and no icon can ever be marked. That is indistinguishable from a part that
+                    // is simply paying, which is a play session per guess. Print both ends and the
+                    // comparison is free.
+                    if (!_loggedAbilityKey && DevLog?.Invoke() == true)
+                    {
+                        _loggedAbilityKey = true;
+                        MelonLogger.Msg($"[TargetingMod] ability state FILED under key '{abilityKey}' = {state}");
+                    }
+                }
                 else snapshot.UnattributedAbilities++;
             }
             catch (Exception e) { Skip(ids[i], snapshot, e); }
@@ -753,51 +1080,6 @@ internal sealed class PositionalGlow
                 snapshot.MergeRelic(key, met ? PartState.Live : PartState.Blocked);
             }
             catch (Exception e) { Skip(ids[i], snapshot, e); }
-        }
-    }
-
-    /// <summary>Which authored entry this effect came from, as the key the icon row is read by.</summary>
-    /// <remarks>
-    /// The game stamps every effect it creates with where it came from : a rank modifier records
-    /// the modifier's entry id, a passive or an active records the ability's. So the entry is on
-    /// the effect and does not have to be reconstructed by walking indexes, which also avoids the
-    /// double counting waiting there : a rank modifier's effects are filed under BOTH the hero
-    /// index and the per-modifier one.
-    ///
-    /// Guarded rather than trusted. `OriginEntryId` is a NULLABLE game field, and reaching one
-    /// through its generated getter is the shape that hands back a null pointer when it is empty
-    /// (interop trap 1). Anything that throws or comes back empty is reported as unattributed, so a
-    /// change in how the game stamps effects shows up as a number in the log rather than as marks
-    /// appearing on the wrong icons.
-    /// </remarks>
-    private bool TryAbilityKey(EffectId effectId, EffectsReader effects, EntityId heroId,
-        string heroKey, out string key)
-    {
-        key = null;
-        try
-        {
-            if (effects?.Data == null) return false;
-            if (!effects.Data.Effects.ContainsKey(effectId)) return false;
-            EffectData effect = effects.Data.Effects[effectId];
-            if (effect == null) return false;
-            EffectOriginData origin = effect.OriginData;
-            // `var` on purpose : this is a nullable of a balancing id whose namespace differs
-            // between the generated assemblies, and naming it here would be one more thing to keep
-            // in step with a game update for no benefit. What matters is that it has a value.
-            var entryId = origin.OriginEntryId;
-            if (!entryId.HasValue) return false;
-            // NOT memoised, and deliberately. See the matching note in PartGlow.TrackAbilitySlot:
-            // BalancingEntryId carries a byte array and a string beside its guid, so it is not
-            // blittable, its bytes are references rather than values, and every cheap way to tell
-            // two of them apart rests on an unverified assumption about the generated bindings. A
-            // wrong answer marks an innocent ability. The hero half of this key IS memoised, by the
-            // caller, because an entity id is a plain guid and can be compared safely.
-            key = PlacementSnapshot.AbilityKey(heroKey, entryId.Value.ToString());
-            return !string.IsNullOrEmpty(key);
-        }
-        catch
-        {
-            return false;
         }
     }
 

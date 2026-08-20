@@ -25,6 +25,12 @@ internal sealed class PredictionResult
     // else : a hero picks again on every hex it crosses, so this is not what the player is shown.
     public Dictionary<string, string> Tick0Targets { get; init; }
     public Dictionary<string, SettledEntity> Settled { get; init; }
+    // The board this was played out on, in hexes. Carried because the only honest way to ask "could
+    // the player have stood somewhere this does not reach" is to measure the ground they may stand
+    // on, and that is the board itself rather than wherever the units happen to have ended up. A
+    // clustered board is not a smaller board.
+    public int BoardWidth { get; init; }
+    public int BoardHeight { get; init; }
     // The playout ran out of ticks while units were still moving, so the picture is not final.
     public bool StillMovingAtCap { get; init; }
     public int Ticks { get; init; }
@@ -64,6 +70,22 @@ internal sealed class SettledEntity
     // A playout that runs to the tick cap can outlive a unit, so a corpse gets no ghost, no
     // movement line and no arrow.
     public bool Alive { get; init; }
+
+    // Everyone else this unit hits, beyond the one it is paired with. Empty for almost every unit
+    // in the game, because almost every attack in the game hits exactly one thing.
+    //
+    // This exists because the picture was previously incapable of saying "and these too". A hero
+    // whose whole point is hitting the room read as identical to a hero hitting one enemy, and the
+    // board could not tell a player that standing two hexes further left would have kept a second
+    // hero out of it. The rules behind it are read from the simulation's own geometry, never
+    // guessed : see Runner.CaptureExtraTargets.
+    public IReadOnlyList<string> ExtraTargets { get; init; }
+
+    // This unit's ordinary attacks also strike everything standing next to whatever it is aimed at.
+    // Authored as a condition on a passive, so it is invisible in the unit's active ability and was
+    // invisible to this mod until now. It is the single most placement-sensitive fact the bosses
+    // have : the primary target is not a choice, but who is standing beside them is.
+    public bool SplashesAroundTarget { get; init; }
 }
 
 // A hypothetical board edit : the contents of two hexes are exchanged. That is exactly what

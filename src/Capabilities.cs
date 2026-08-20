@@ -16,7 +16,7 @@ internal sealed class Capabilities
     public bool NativeUi { get; private set; } = true;
     // The main menu switch, kept apart from NativeUi even though both are buttons cloned from the
     // game. They live in different scenes with different lifetimes, and a failure in one has no
-    // bearing on the other : losing the menu button must not blank the three placement toggles,
+    // bearing on the other : losing the menu button must not blank the four placement toggles,
     // and a placement toggle that threw must not cost the player the only way back on.
     public bool MenuUi { get; private set; } = true;
     public bool DragPreview { get; private set; } = true;

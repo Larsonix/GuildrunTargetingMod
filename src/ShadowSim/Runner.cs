@@ -4,6 +4,7 @@ using System.Diagnostics;
 using GuildrunTargetingMod.Interop;
 using Il2CppEmber.Balancing;
 using Il2CppEmber.Balancing.Sheets.Characters.Attacks;
+using Il2CppEmber.Balancing.Sheets.Items;
 using Il2CppEmber.Balancing.SimulationBridge;
 using Il2CppEmber.Balancing.SimulationBridge.Context;
 using Il2CppEmber.Simulation.Core;
@@ -11,6 +12,7 @@ using Il2CppEmber.Simulation.Core.Config;
 using Il2CppEmber.Simulation.Core.Fsm;
 using Il2CppEmber.Simulation.Core.State;
 using Il2CppEmber.Simulation.Core.State.Entities;
+using Il2CppEmber.Simulation.Core.Utilities;
 using Il2Cppgg.leyline.netcode.Utilities;
 using Il2CppInterop.Runtime.InteropTypes;
 using MelonLoader;
@@ -58,6 +60,7 @@ internal sealed class Runner
     private readonly Dictionary<string, Vector2Int> _previousTickCells = new(StringComparer.Ordinal);
     // BeginRun clears this because every replay owns a newly initialized frame and entity set.
     private readonly Dictionary<IntPtr, string> _entityIds = new();
+    private string _lastExtraFault;
     private NoOpErrorReporter _reporterRoot;
     private IErrorReporting _reporter;
     private SimulationReferences _references;
@@ -102,6 +105,13 @@ internal sealed class Runner
     public PlacementSnapshot OpeningPlacement { get; private set; }
 
     public Runner(Capabilities capabilities) => _capabilities = capabilities;
+
+    /// <summary>
+    /// How many units each unit's attack lands on. Set by the mod, like the overlay's own answers
+    /// are ; null leaves every unit single-target, which is what it was before this existed and is
+    /// still correct for almost all of them.
+    /// </summary>
+    public Func<string, MultiHit.Rule> Rules { get; set; }
 
     /// <summary>
     /// Asked once per playout, at the opening frame, what this board does for the parts that care
@@ -475,11 +485,14 @@ internal sealed class Runner
                 if (entity == null) continue;
                 string id = entity.Id.ToString();
                 targets.TryGetValue(id, out string pairing);
+                MultiHit.Rule rule = Rules != null ? Rules(id) : default;
                 settled[id] = new SettledEntity
                 {
                     Cell = entity.CellPosition,
                     TargetPairing = pairing,
-                    Alive = entity.IsAlive()
+                    Alive = entity.IsAlive(),
+                    ExtraTargets = CaptureExtraTargets(frame, entity, rule, pairing),
+                    SplashesAroundTarget = rule.SplashesAroundTarget
                 };
             }
         }
@@ -492,6 +505,8 @@ internal sealed class Runner
             OpeningPositions = _openingPositions ?? new Dictionary<string, FPVector3>(StringComparer.Ordinal),
             Tick0Targets = _tick0Targets ?? new Dictionary<string, string>(StringComparer.Ordinal),
             Settled = settled,
+            BoardWidth = _config != null ? _config.BoardWidth : 0,
+            BoardHeight = _config != null ? _config.BoardHeight : 0,
             StillMovingAtCap = movingAtCap,
             Ticks = _ticks,
             PreventedDeaths = CountGrants(),
@@ -504,6 +519,97 @@ internal sealed class Runner
         OpeningPlacement = null;
         _simulation = null;
         _offsetObservations.Clear();
+    }
+
+    /// <summary>
+    /// Everyone else this unit's attack lands on, at the settled instant, or null when it lands on
+    /// one thing like almost every attack in this game.
+    /// </summary>
+    /// <remarks>
+    /// The membership test is the simulation's OWN <c>HexGridUtils.Distance</c>, not a distance
+    /// written here that happens to agree today. Hex distance on an offset grid is not the obvious
+    /// formula, the game already ships the answer, and a second implementation is a second thing to
+    /// drift.
+    ///
+    /// Range is read as the LIVE stat rather than the hero's authored one, because a rank modifier
+    /// or a specialization that grants Attack Range is exactly the case where a static number would
+    /// quietly under-report the picture. Ming's rule is a distance of exactly one and does not read
+    /// range at all, which is why the two are separate cases rather than one with a parameter.
+    /// </remarks>
+    private IReadOnlyList<string> CaptureExtraTargets(Frame frame, Entity entity, MultiHit.Rule rule, string primary)
+    {
+        if (rule.IsPlain) return null;
+        List<string> extras = null;
+        try
+        {
+            bool sourceIsHero = entity.IsHero;
+            // Two independent mechanisms, and a unit could in principle carry both, so both are
+            // gathered into one list rather than one being treated as a variant of the other.
+            //
+            // Reach is measured from the UNIT : that is what FunkeAbilityAction, TillyAction and
+            // MingAbilityAction each do. Splash is measured from the unit it is ATTACKING, at a
+            // distance of exactly one, which is IsAdjacentToTriggerTargetCondition's own test read
+            // literally. Exactly one, not within one : the thing being hit is already hit by the
+            // ordinary attack and is not part of the splash.
+            bool hasReach = rule.Reach != MultiHit.Reach.Single;
+            bool neighboursOnly = rule.Reach == MultiHit.Reach.Neighbours;
+            int range = !hasReach || neighboursOnly ? 1 : entity.GetStat(TargetStatType.AttackRange).IntValue;
+
+            bool hasSplashOrigin = false;
+            Vector2Int splashOrigin = default;
+            if (rule.SplashesAroundTarget && primary != null)
+                hasSplashOrigin = TryCellOf(frame, primary, out splashOrigin);
+
+            for (int i = 0; i < frame.Entities.Count; i++)
+            {
+                Entity other = frame.Entities[i];
+                if (other == null || other.Pointer == entity.Pointer) continue;
+                // The other side only. Every rule behind this walks the caster's enemies.
+                if (other.IsHero == sourceIsHero || !other.IsAlive()) continue;
+                string id = EntityIdString(other);
+                // The paired target already has an arrow of its own ; this list is the ones that
+                // would otherwise be invisible.
+                if (string.Equals(id, primary, StringComparison.Ordinal)) continue;
+
+                bool hit = false;
+                if (hasReach)
+                {
+                    int fromUnit = HexGridUtils.Distance(other.CellPosition, entity.CellPosition);
+                    hit = neighboursOnly ? fromUnit == 1 : fromUnit <= range;
+                }
+                if (!hit && hasSplashOrigin)
+                    hit = HexGridUtils.Distance(other.CellPosition, splashOrigin) == 1;
+                if (!hit) continue;
+                (extras ??= new List<string>()).Add(id);
+            }
+        }
+        catch (Exception e)
+        {
+            // A unit whose extra reach cannot be read falls back to its single arrow, which is what
+            // it had before. Nothing about the rest of the picture depends on this.
+            if (_lastExtraFault != e.Message)
+            {
+                _lastExtraFault = e.Message;
+                MelonLogger.Warning("[TargetingMod] extra targets unreadable for one unit: " + e.Message);
+            }
+            return null;
+        }
+        return extras;
+    }
+
+    /// <summary>The hex a unit is standing on this frame, by its id.</summary>
+    private bool TryCellOf(Frame frame, string id, out Vector2Int cell)
+    {
+        cell = default;
+        for (int i = 0; i < frame.Entities.Count; i++)
+        {
+            Entity entity = frame.Entities[i];
+            if (entity == null) continue;
+            if (!string.Equals(EntityIdString(entity), id, StringComparison.Ordinal)) continue;
+            cell = entity.CellPosition;
+            return true;
+        }
+        return false;
     }
 
     private static bool CellsEqual(

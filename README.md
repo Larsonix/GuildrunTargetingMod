@@ -23,8 +23,8 @@ The mod does not change the fight. It only shows what was already going to happe
 
 ## Download
 
-[![Download with MelonLoader](https://img.shields.io/badge/Download-with%20MelonLoader-2ea043?style=for-the-badge)](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.2.0/GuildrunTargetingMod-v2.2.0-with-MelonLoader.zip)
-[![Download mod only](https://img.shields.io/badge/Download-mod%20only-30363d?style=for-the-badge)](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.2.0/GuildrunTargetingMod-v2.2.0-mod-only.zip)
+[![Download with MelonLoader](https://img.shields.io/badge/Download-with%20MelonLoader-2ea043?style=for-the-badge)](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.5.1/GuildrunTargetingMod-v2.5.1-with-MelonLoader.zip)
+[![Download mod only](https://img.shields.io/badge/Download-mod%20only-30363d?style=for-the-badge)](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.5.1/GuildrunTargetingMod-v2.5.1-mod-only.zip)
 
 * **With MelonLoader** if you have never installed a mod for this game. It contains everything.
 * **Mod only** if you already have MelonLoader.
@@ -47,8 +47,17 @@ On Linux or a Steam Deck there is [one extra step](#linux-and-steam-deck).
 
 ## Update
 
+**The mod tells you when a new version is out.** A message in the main menu names it, says which
+version you are on, and offers to open the download for you. Accepting opens the mod-only zip and
+your game folder, so the file has somewhere to go the moment it arrives. Each version is offered
+once ; decline it and it is not mentioned again for that version.
+
+To do that, the mod asks GitHub once per launch what the newest version is. That is the only time
+it touches the internet, it asks nothing else and it sends nothing about you. Set `CheckForUpdates`
+to `false` in the settings file and it never contacts anything.
+
 **Nothing to uninstall.** An update is the same drag as the install. Take the
-**[mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.2.0/GuildrunTargetingMod-v2.2.0-mod-only.zip)**,
+**[mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.5.1/GuildrunTargetingMod-v2.5.1-mod-only.zip)**,
 drop its `Mods` folder into the game folder, and say yes when Windows asks to replace the file.
 If the game is open, restart it : the new file is only read when the game starts.
 
@@ -71,7 +80,7 @@ To play for the leaderboards, switching the mod off in the main menu is enough.
 ## What it shows
 
 **Hover a unit** and you get the unit you point at, the one it fights once the board settles, and
-every unit fighting it there. Each with its final position, its movement line and its attack arrow.
+every unit fighting it there. Each with its final position, its movement line and its attack arrows.
 
 ![Hovering a single unit to show its final position, its area and its attack arrow](docs/media/hover.gif)
 
@@ -80,10 +89,11 @@ are hidden while it is on.
 
 ![Toggling the opening preview so the whole board fills with predicted positions and arrows](docs/media/preview-toggle.gif)
 
-**Three buttons, three shortcuts.** **P** for the preview, **F** for where attack arrows start,
-**T** for see-through units. Each has a tooltip giving its name, its shortcut and what it does.
+**Three buttons, three shortcuts.** **P** for the preview, **T** for see-through units, **G** for
+the ability areas. Each has a tooltip giving its name, its shortcut and what it does, and each
+remembers how you left it.
 
-![The three buttons and their tooltips](docs/media/buttons.gif)
+![The mod's buttons and their tooltips](docs/media/buttons.gif)
 
 **Parts that care where a hero stands are marked.** Items, relics, rank modifiers and
 specializations that only pay from the front row, from the back row, next to an ally or alone in a
@@ -105,10 +115,18 @@ stays quiet when moving it would not help.
 
 ![The Rift Seal icon carrying a red animated border and a red line across it](docs/media/rift-seal.gif)
 
+**Attacks that hit several units show every unit they hit.** Most attacks in this game hit exactly
+one thing, and those get the one arrow they have always had. The ones that do not get an arrow each :
+Funke's fireball catches every enemy in his range, Ming's burst everything beside him, and the
+Dragons' ordinary attacks strike every Hero standing next to the one they are aimed at. Those extra
+lines fan out from the Hero being struck, because that is where the splash comes from, and moving
+that neighbour one hex is usually the whole answer.
+
 Three more things it draws :
 
 * **The ground an ability covers**, as a dashed outline anchored on the unit. Enemies get one too,
-  so you can see what to move out of.
+  so you can see what to move out of. This one has its own button, **G**, so you can put the
+  outlines away without giving up anything else the board is showing you.
 * **A unit that jumps.** A Lizard is thrown to your back line the instant the fight starts, before
   it walks anywhere. That jump is a fainter, thinner line, the hex it lands on is marked in grey,
   and its normal movement line carries on from there.
@@ -177,7 +195,7 @@ They hold game state and nothing else, and you can delete them.
 
 The full zip also contains MelonLoader, unmodified. MelonLoader reaches the internet on first
 launch to fetch its own dependencies, which is the minute the install section mentions. The
-[mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.2.0/GuildrunTargetingMod-v2.2.0-mod-only.zip)
+[mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.5.1/GuildrunTargetingMod-v2.5.1-mod-only.zip)
 does not contain it.
 
 ## Settings
@@ -199,27 +217,34 @@ Under `[GuildrunTargetingMod]` :
 | --- | --- | --- |
 | `Enabled` | `true` | Turns the whole mod on or off. The main menu button writes this one too. |
 | `DragLivePreview` | `true` | Computes the hex under a held hero. `false` hides the visuals while dragging. |
-| `ArrowsFromGhosts` | `true` | Attack arrows start at the predicted positions instead of the current ones. |
+| `ArrowsFromGhosts` | `true` | Attack arrows start at the predicted positions instead of the current ones. No in-game button; set it here. |
 | `MidlineArrowheads` | `false` | Adds a direction chevron in the middle of each line. No in-game button : set it here. |
 | `TransparentUnits` | `true` | Fades the units for the whole placement so you can see the board through them. |
-| `PreviewStartsOn` | `false` | Starts each battle with the opening preview already on. |
+| `AbilityAreas` | `true` | Draws the ground each ability covers, for enemies as well as heroes. The in-game button writes this one too, so the file and the button can never disagree. |
+| `PreviewStartsOn` | `false` | Starts each battle with the opening preview already on. The preview button writes this one too, so the file and the button can never disagree. |
 | `PreviewKey` | `P` | Key that toggles the opening preview. |
-| `ArrowOriginKey` | `F` | Key that toggles where attack arrows start. |
 | `TransparencyKey` | `T` | Key that toggles see-through units. |
+| `AbilityAreasKey` | `G` | Key that toggles the ability areas. |
 | `TickBudgetMs` | `2.0` | Most simulation time allowed per frame during placement. Less is used when your machine has no time to spare. |
 | `DragTickBudgetMs` | `6.0` | Most simulation time allowed per frame while dragging. Less is used when your machine has no time to spare. |
 | `MarkLapSeconds` | `3.6` | Seconds for one lap of the lights on a marked item's border. `0` keeps the border and stops the motion. |
+| `CheckForUpdates` | `true` | Asks GitHub once per launch whether a newer version of the mod exists, and offers it in the main menu. `false` stops the mod contacting the internet at all. |
 | `MeasureDrawCost` | `false` | Diagnostic. Briefly blinks the board overlay on and off to measure what drawing it costs your machine. Leave off for normal play. |
 | `DevLog` | `false` | Verbose logs, plus a dump of the resolved UI. |
 
-Five more entries appear in the same section and are written by the mod, not by you :
+Seven more entries appear in the same section and are written by the mod, not by you :
 `TestedBuildGuid`, `ParityFailureVersion` and `ParityMismatchStreak` remember whether the preview
 has agreed with the game. `ModdedRunId` and `LeaderboardNoticeShown` remember which run was played
-with the mod on and whether the notice was shown. Do not edit them by hand.
+with the mod on and whether the notice was shown. `SettingsMigration` records how far this file has
+been brought forward by an update, so each of those changes happens once and never argues with a
+value you set afterwards. `LastUpdateNoticeVersion` records the newest version already offered in
+the main menu, which is what makes each one offered once. Do not edit them by hand.
 
-The arrow origin and the see-through units also have in-game toggles, next to the preview toggle.
-Both are remembered between battles and between sessions ; the preview itself starts off in every
-battle unless `PreviewStartsOn` says otherwise. The shortcuts work during placement only. A key
+The see-through units and the ability areas also have in-game toggles, next to the preview
+toggle. All three are remembered between battles and between sessions : each one writes its own
+line above when you press it, so you set a button the way you like it once and it stays that way.
+A fresh install still opens its first battle on the ordinary board, with the preview off and the
+areas on. The shortcuts work during placement only. A key
 name is anything the Unity Input System knows (`P`, `F1`, `Numpad1`, `Backquote`). If a name is not
 recognised, that one shortcut falls back to its default and the log says so.
 
@@ -264,7 +289,7 @@ If it happens to you, take MelonLoader from its own page and the small zip from 
    the Linux, macOS and installer files are not for this either.
 2. Drag its content into the game folder, exactly like step 2 of the install.
 3. Then take the
-   [mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.2.0/GuildrunTargetingMod-v2.2.0-mod-only.zip)
+   [mod only zip](https://github.com/Larsonix/GuildrunTargetingMod/releases/download/v2.5.1/GuildrunTargetingMod-v2.5.1-mod-only.zip)
    and drag its content in as well.
 
 You end up with the same folder either way. The `version.dll` in the full zip is byte for byte the

@@ -139,6 +139,7 @@ internal sealed class OverlayRenderer
     private bool _lastArrowsFromGhosts;
     private bool _lastMidlineHeads;
     private bool _lastTransparent;
+    private bool _lastShowAreas;
     private bool _lastResolved;
     private int _lastCapabilityGeneration = -1;
     private Vector3 _lastCamPos;
@@ -156,6 +157,23 @@ internal sealed class OverlayRenderer
     private Sprite _heroTileSprite;
     private Sprite _enemyTileSprite;
     private int _frameStamp;
+    // Where this frame's footprints went, and the most any frame of this placement saw.
+    //
+    // THE PEAKS ARE THE REPORTED NUMBERS AND THE PER-FRAME ONES ARE NOT. Reporting the last drawn
+    // frame was the first shape of this instrument and it answered nothing: the report prints when
+    // placement ENDS, and the last drawn frame by then is an idle one with nothing hovered and the
+    // preview off, so all four counters read zero and "the areas never drew" was indistinguishable
+    // from "the areas drew for ten minutes and then the player let go of the mouse". Measured
+    // 2026-08-20: exactly that, four zeroes and no information. The question being asked is "did
+    // this ever happen during the placement", so the statistic has to be a peak.
+    private int _aoeDrawn;
+    private int _aoeNoShape;
+    private int _aoeSuppressed;
+    private int _aoeRefusedBySwitch;
+    private int _peakAoeDrawn;
+    private int _peakAoeNoShape;
+    private int _peakAoeSuppressed;
+    private int _peakAoeRefusedBySwitch;
     private int _lineCursor;
     private int _headCursor;
     private int _cellCursor;
@@ -188,6 +206,15 @@ internal sealed class OverlayRenderer
     // moved or not, so "standing on a lit tile" still means "this is where it ends up", and a
     // mover is still told apart by having a ghost and a movement line somewhere else.
     public bool Transparent { get; set; } = true;
+
+    // The player's ability areas button. On, the default, the footprints are drawn wherever the
+    // current mode draws anything : the hovered unit's own in hover, every unit's with the preview
+    // on, and following a hero being dragged. Off, none of them anywhere.
+    //
+    // This is deliberately NOT a mode of its own. The areas answer "what ground does this cover",
+    // which is a question about a picture the player is already looking at, so it belongs to
+    // whichever picture that is rather than becoming a fourth one.
+    public bool ShowAreas { get; set; } = true;
 
     // Asks whether a Hero has a part that cares about where it is standing, and whether the board
     // as arranged is satisfying it. Set by the mod each frame ; null whenever the feature is off or
@@ -322,6 +349,7 @@ internal sealed class OverlayRenderer
         if (ArrowsFromGhosts != _lastArrowsFromGhosts) return false;
         if (MidlineHeads != _lastMidlineHeads) return false;
         if (Transparent != _lastTransparent) return false;
+        if (ShowAreas != _lastShowAreas) return false;
         if (_resolved != _lastResolved) return false;
         // A feature going down changes what is drawn and appears in none of the arguments. Without
         // this, a rendering fault that switched the preview off would leave the preview on screen:
@@ -357,6 +385,7 @@ internal sealed class OverlayRenderer
         _lastArrowsFromGhosts = ArrowsFromGhosts;
         _lastMidlineHeads = MidlineHeads;
         _lastTransparent = Transparent;
+        _lastShowAreas = ShowAreas;
         _lastResolved = _resolved;
         try
         {
@@ -410,6 +439,10 @@ internal sealed class OverlayRenderer
         _lineCursor = 0;
         _headCursor = 0;
         _cellCursor = 0;
+        _aoeDrawn = 0;
+        _aoeNoShape = 0;
+        _aoeSuppressed = 0;
+        _aoeRefusedBySwitch = 0;
         _cellStamps.Clear();
         _pullActive = false;
         try
@@ -422,6 +455,7 @@ internal sealed class OverlayRenderer
             _drag = drag;
             if (_capabilities.Overlay && _capabilities.Prediction && _resolved && prediction != null && !hideWorld)
             {
+                BoardExtent = MeasureBoardExtent(prediction, board);
                 if (PreviewEnabled && _capabilities.Preview)
                     RenderPreview(prediction, views, board);
                 else if (!string.IsNullOrEmpty(hovered))
@@ -450,6 +484,12 @@ internal sealed class OverlayRenderer
         // front and turning back on what is needed, which touched every object twice a frame.
         Sweep();
         SortTranslucentBodies();
+        // Taken after the drawing and before the picture is remembered, so every frame that actually
+        // drew contributes and the frames the renderer skips as unchanged leave the peaks standing.
+        if (_aoeDrawn > _peakAoeDrawn) _peakAoeDrawn = _aoeDrawn;
+        if (_aoeNoShape > _peakAoeNoShape) _peakAoeNoShape = _aoeNoShape;
+        if (_aoeSuppressed > _peakAoeSuppressed) _peakAoeSuppressed = _aoeSuppressed;
+        if (_aoeRefusedBySwitch > _peakAoeRefusedBySwitch) _peakAoeRefusedBySwitch = _aoeRefusedBySwitch;
         // Recorded last, so what is remembered is a picture that was actually drawn. Everything
         // above this line can throw into its own handler and leave the overlay half written, and
         // remembering before the work would have told the next frame that half written state was
@@ -501,8 +541,15 @@ internal sealed class OverlayRenderer
         // Marks the unit being pointed at. The game gives no feedback of its own for hovering a
         // unit, and its placement tile is the closest thing it has to saying "this one".
         Vector3Int hoveredCell = UnitCell(board, hovered, from);
-        DrawUnitCell(board.PlacementGrid.GetCellCenterWorld(hoveredCell), hovered, hero);
+        DrawPlacementCell(board.PlacementGrid.GetCellCenterWorld(hoveredCell), hovered, hero);
         DrawHoveredAoe(result, board, hovered, hero, hoveredCell);
+        // Hovering one unit has to answer the same question the preview does. A hero whose whole
+        // point is hitting several enemies read as single-target here for four versions, because
+        // this path only ever drew the one pairing.
+        Vector3 reachAnchor = board.PlacementGrid.GetCellCenterWorld(hoveredCell);
+        if (ArrowsFromGhosts && result.Settled.TryGetValue(hovered, out SettledEntity hoveredSettled))
+            reachAnchor = CenterOfCell(board, hoveredSettled.Cell);
+        DrawExtraReach(result, views, board, hovered, reachAnchor, hero);
 
         if (ArrowsFromGhosts) RenderHoverGhostFrame(result, views, board, hovered);
         else RenderHoverStartFrame(result, views, board, hovered, from, hero, hoveredCell);
@@ -600,7 +647,7 @@ internal sealed class OverlayRenderer
         if (!string.IsNullOrEmpty(target) && SettledAlive(result, target) &&
             views.TryGetView(target, out CharacterViewController to))
         {
-            DrawUnitCell(UnitCellCenter(board, target, to), target, views.IsHero(target));
+            DrawPlacementCell(UnitCellCenter(board, target, to), target, views.IsHero(target));
             DrawCurved(UnitBodyPosition(board, hovered, from), UnitCellCenter(board, target, to), hero ? HeroColor : EnemyColor, 1f);
         }
 
@@ -612,7 +659,7 @@ internal sealed class OverlayRenderer
             if (views.TryGetView(pair.Key, out CharacterViewController incoming))
             {
                 bool attackerHero = views.IsHero(pair.Key);
-                DrawUnitCell(UnitCellCenter(board, pair.Key, incoming), pair.Key, attackerHero);
+                DrawPlacementCell(UnitCellCenter(board, pair.Key, incoming), pair.Key, attackerHero);
                 DrawCurved(UnitBodyPosition(board, pair.Key, incoming), board.PlacementGrid.GetCellCenterWorld(hoveredCell),
                     attackerHero ? HeroColor : EnemyColor, 1f);
             }
@@ -626,6 +673,8 @@ internal sealed class OverlayRenderer
         if (!result.Settled.TryGetValue(id, out SettledEntity settled) || !settled.Alive) return;
         bool hero = views.IsHero(id);
         Vector3 center = board.PlacementGrid.GetCellCenterWorld(new Vector3Int(settled.Cell.x, settled.Cell.y, 0));
+        // First, so the hex the player chose owns its tile before the walk claims one.
+        DrawPlacementCell(UnitCellCenter(board, id, view), id, hero);
         DrawMovementFor(result, id, view, hero, settled.Cell, center, board);
         // A tile even when the unit does not move at all : a long-range arc leaving an unmarked
         // hex read as coming from somewhere else. One tile per hex, so this costs nothing when
@@ -741,6 +790,8 @@ internal sealed class OverlayRenderer
             if (!views.TryGetView(id, out CharacterViewController view)) continue;
             bool hero = views.IsHero(id);
             Vector3 settled = board.PlacementGrid.GetCellCenterWorld(new Vector3Int(pair.Value.Cell.x, pair.Value.Cell.y, 0));
+            // First, so the hex the player chose owns its tile before the walk claims one.
+            DrawPlacementCell(UnitCellCenter(board, id, view), id, hero);
             DrawMovementFor(result, id, view, hero, pair.Value.Cell, settled, board);
             // A tile under the hex every arc leaves from, whether the unit moved or not, for the
             // same reason as in hover mode. It shares the tile with a mover's landing hex.
@@ -769,6 +820,7 @@ internal sealed class OverlayRenderer
             // which way their owner is turned.
             DrawAoe(anchor, id, hero, targetAnchor, hasTarget);
             if (hasTarget) DrawCurved(anchor, targetAnchor, hero ? HeroColor : EnemyColor, 1f);
+            DrawExtraReach(result, views, board, id, anchor, hero);
         }
     }
 
@@ -939,7 +991,28 @@ internal sealed class OverlayRenderer
     //
     // Enemies are never asked about. Items, relics, rank modifiers and specialization passives are
     // all the player's, and the feature is about a board the player can rearrange.
-    private void DrawUnitCell(Vector3 position, string id, bool hero)
+    // A plain team-coloured tile. This one NEVER carries the placement mark.
+    //
+    // It used to, and that was the defect: every tile a unit got was asked whether its parts were
+    // paying, including the tile on the hex it WALKS TO. So a Hero placed on a bad hex lit the hex it
+    // ran to instead, or both at once when it moved, and the one hex the player could actually act on
+    // was the one least likely to be marked. Reported 2026-08-20: "it should only and always appear
+    // on the hex the player is placing the hero".
+    //
+    // The mark answers a question about a PLACEMENT, and the placement is the hex the player chose.
+    // Where the unit ends up after walking is not something any amount of rearranging can change,
+    // which is the same reason PositionalGlow judges the rules at the opening frame and never at the
+    // settled one. The picture now agrees with the answer.
+    private void DrawUnitCell(Vector3 position, string id, bool hero) =>
+        DrawCell(position, hero, hero ? HeroColor : EnemyColor, 1f);
+
+    // The tile on the hex the PLAYER put this Hero on, carrying the placement mark when it has one.
+    //
+    // Must be laid down BEFORE any other tile this unit draws. One tile is drawn per hex per frame
+    // and the first writer wins, so calling this first means a Hero that does not move gets the
+    // marked tile rather than the plain one the settled draw would otherwise have put there, and a
+    // Hero that does move gets the mark on its own hex and a plain tile where it lands.
+    private void DrawPlacementCell(Vector3 position, string id, bool hero)
     {
         PartState state = hero && HeroGlow != null && id != null ? HeroGlow(id) : PartState.NotPositional;
         switch (state)
@@ -969,11 +1042,121 @@ internal sealed class OverlayRenderer
     // Honest for the settled opening and no further, which is the contract the rest of the picture
     // already makes. Nothing here mixes two instants : the anchor, the facing and the arrows all
     // describe the same moment.
+    // The other units this one's attack lands on, and the ground it splashes across. Both are read
+    // off the settled snapshot rather than worked out here : the rules live with the playout, beside
+    // the simulation whose geometry they borrow.
+    //
+    // Drawn in the same team colour and the same shape as the primary arc, deliberately. These are
+    // not a weaker kind of hit or a maybe ; a unit inside Funke's range is being hit exactly as hard
+    // as the one he is aimed at, and a second line style would say otherwise.
+    private void DrawExtraReach(PredictionResult result, UnitViewRegistry views, BoardController board,
+        string id, Vector3 anchor, bool hero)
+    {
+        if (!result.Settled.TryGetValue(id, out SettledEntity settled)) return;
+        IReadOnlyList<string> extras = settled.ExtraTargets;
+        if (extras == null) return;
+        Color color = hero ? HeroColor : EnemyColor;
+        // A splash comes off the unit being struck, not off the striker, so its arcs start there.
+        // Drawing them from the attacker would say the dragon reaches each of those heroes, when
+        // what it really does is hit one hero hard enough to catch whoever is standing beside them.
+        // That distinction is the entire reason a player moves someone.
+        Vector3 origin = anchor;
+        if (settled.SplashesAroundTarget && settled.TargetPairing != null &&
+            TryAnchorOf(result, views, board, settled.TargetPairing, out Vector3 impact))
+            origin = impact;
+        for (int i = 0; i < extras.Count; i++)
+        {
+            string other = extras[i];
+            if (!SettledAlive(result, other)) continue;
+            if (!TryAnchorOf(result, views, board, other, out Vector3 target)) continue;
+            DrawCurved(origin, target, color, 1f);
+        }
+    }
+
+    // Where a unit's arc should end : its settled hex when arcs run to final positions, and the hex
+    // it is standing on right now when they do not. The same rule the primary arc follows, so an
+    // extra target can never disagree with the arrow beside it.
+    private bool TryAnchorOf(PredictionResult result, UnitViewRegistry views, BoardController board,
+        string id, out Vector3 anchor)
+    {
+        anchor = default;
+        if (ArrowsFromGhosts)
+        {
+            if (!result.Settled.TryGetValue(id, out SettledEntity settled)) return false;
+            anchor = CenterOfCell(board, settled.Cell);
+            return true;
+        }
+        if (!views.TryGetView(id, out CharacterViewController view) || view == null) return false;
+        anchor = UnitCellCenter(board, id, view);
+        return true;
+    }
+
+    // The furthest two occupied hexes on the board are apart, in world units, recomputed once per
+    // drawn frame. Zero until a frame has been drawn, which reads as "do not suppress anything" and
+    // is the safe direction to be wrong in.
+    private float BoardExtent { get; set; }
+
+    // The board's own corner-to-corner span in world units.
+    //
+    // Measured from the BOARD, never from where the units happen to be standing. The question this
+    // answers is "could the player have stood somewhere this does not reach", and the ground they
+    // may stand on is the whole board : a team that happens to be huddled together is not playing on
+    // a smaller board, and measuring the huddle would shrink the threshold until an ordinary,
+    // perfectly dodgeable zone started being suppressed as unavoidable.
+    //
+    // Zero when the playout could not report a board, which reads as "suppress nothing" and is the
+    // safe direction to be wrong in : a footprint too many is a picture, a footprint too few is a
+    // player walking into something the mod knew about.
+    private static float MeasureBoardExtent(PredictionResult result, BoardController board)
+    {
+        if (result.BoardWidth <= 0 || result.BoardHeight <= 0) return 0f;
+        Vector3 origin = CenterOfCell(board, new Vector2Int(0, 0));
+        Vector3 far = CenterOfCell(board, new Vector2Int(result.BoardWidth - 1, result.BoardHeight - 1));
+        return Vector3.Distance(origin, far);
+    }
+
+    // True when the shape reaches far enough to contain the whole board from wherever it is placed.
+    // Half the extent is the test because the worst case for a dodger is the shape landing at the
+    // board's centre : a reach of half the span from there already touches both ends.
+    //
+    // CIRCLES ONLY, and that restriction is the whole correctness of it. MaxReach is the distance to
+    // the shape's furthest point, which for a circle IS its radius and therefore does describe how
+    // much ground it covers. For a rectangle the two numbers have nothing to do with each other: a
+    // beam laid across the board has a far corner and covers a strip, and a player steps out of it
+    // sideways.
+    //
+    // Measured 2026-08-20 over all 27 authored areas. Without this clause the rule refused four of
+    // them: the Dragons' Flame, Frost and Poison Breath, circles of reach 12.00, which is the rule
+    // doing its job, and Requiem Barrage, a RECTANGLE of reach 24.83, which is dodgeable and was
+    // hidden on every board it appeared on. Reported as "the ability area stuff does not work at
+    // all". Retuning the threshold could not have fixed it: the next rectangles down sit at 11.36
+    // against a cutoff of 11.55, so any line drawn there either keeps hiding a dodgeable shape or
+    // starts showing an undodgeable one. The measure was wrong for rectangles, not the number.
+    private static bool CoversEverything(AoeOutline outline, float boardExtent) =>
+        outline.AllCircles && boardExtent > 0f && outline.MaxReach >= boardExtent * 0.5f;
+
     private void DrawAoe(Vector3 anchor, string id, bool hero, Vector3 facingTowards, bool hasFacing)
     {
-        if (UnitAoe == null || id == null) return;
+        // Refused here rather than at the two places that ask, so that both are covered by one line
+        // and a third caller added later inherits the switch instead of having to remember it.
+        //
+        // EVERY EXIT BELOW IS COUNTED. There are four ways for a footprint not to appear and they
+        // were indistinguishable from outside: the log could say "one unit has a footprint to draw"
+        // while the board showed none, and both statements were true at once. Reported 2026-08-20 as
+        // "the ability area stuff does not work at all", against a build whose area scan was proven
+        // byte-identical to the one before it, which is a whole play session spent learning which of
+        // four lines returned. The counters cost four ints.
+        if (!ShowAreas) { _aoeRefusedBySwitch++; return; }
+        if (UnitAoe == null || id == null) { _aoeRefusedBySwitch++; return; }
         AoeOutline outline = UnitAoe(id);
-        if (outline == null) return;
+        if (outline == null) { _aoeNoShape++; return; }
+        // An area nobody can step out of is not a placement choice, and drawing one says there is a
+        // choice to make. The Final Boss dragons are the case this exists for : their breath is
+        // authored as a circle wide enough to swallow the whole board, because what it really means
+        // is "every enemy", and painting that as a ring around the dragon invited players to dodge
+        // something undodgeable. Measured against the board in front of the player rather than
+        // against a threshold, so a smaller board or a bigger shape both stay correct.
+        if (CoversEverything(outline, BoardExtent)) { _aoeSuppressed++; return; }
         // Coloured for the unit that places it, never for who it lands on. That is already the rule
         // every arc on this board follows, and a footprint is the same statement about the same
         // unit : colouring it by who it would catch made three areas around one hero read as three
@@ -986,8 +1169,22 @@ internal sealed class OverlayRenderer
             flat.y = 0f;
             if (flat.sqrMagnitude > 0.0001f) facing = Mathf.Atan2(flat.x, flat.z);
         }
+        _aoeDrawn++;
         for (int i = 0; i < outline.Loops.Length; i++) DrawOutlineLoop(outline.Loops[i], anchor, facing, color);
     }
+
+    /// <summary>Where this frame's footprints went, for the log at the end of a placement.</summary>
+    /// <remarks>
+    /// Describes the last DRAWN frame, not the placement, because the counters are cleared with the
+    /// rest of the frame state in Render. A frame the renderer skipped as unchanged leaves the last
+    /// real frame's numbers standing, which is what anyone reading this wants: the picture on screen
+    /// is that frame's picture.
+    /// </remarks>
+    internal string AoeDiagnostic =>
+        $"most in any one frame of this placement: {_peakAoeDrawn} footprint(s) drawn, " +
+        $"{_peakAoeNoShape} unit(s) with no shape to draw, " +
+        $"{_peakAoeSuppressed} suppressed as covering the whole board, " +
+        $"{_peakAoeRefusedBySwitch} refused by the areas switch; board extent {BoardExtent:F1}";
 
     // One closed ring, handed to the engine in a single call. Turned only when the shape is one of
     // the handful that is not a circle : a circle looks the same whichever way its owner faces, and
@@ -1158,6 +1355,12 @@ internal sealed class OverlayRenderer
     public void ClearPlacement()
     {
         InvalidatePicture();
+        // The peaks describe one placement, so they start again with it. Cleared here rather than on
+        // the way out, because the report that prints them runs before this does.
+        _peakAoeDrawn = 0;
+        _peakAoeNoShape = 0;
+        _peakAoeSuppressed = 0;
+        _peakAoeRefusedBySwitch = 0;
         _drag = null;
         _frameStamp++;
         _lineCursor = 0;

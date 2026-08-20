@@ -29,6 +29,7 @@ public sealed class Mod : MelonMod
     private PositionalGlow _glow;
     private PartGlow _partGlow;
     private AoeShapes _aoe;
+    private MultiHit _multiHit;
     private MelonPreferences_Entry<bool> _enabled;
     private MelonPreferences_Entry<bool> _devLog;
     private MelonPreferences_Entry<bool> _measureDrawCost;
@@ -36,10 +37,13 @@ public sealed class Mod : MelonMod
     private MelonPreferences_Entry<bool> _midlineHeads;
     private MelonPreferences_Entry<bool> _transparentUnits;
     private MelonPreferences_Entry<bool> _previewStartsOn;
+    private MelonPreferences_Entry<bool> _abilityAreas;
     private MelonPreferences_Entry<bool> _dragLivePreview;
+    private MelonPreferences_Entry<bool> _checkForUpdates;
+    private UpdateCheck _updates;
     private MelonPreferences_Entry<string> _previewHotkey;
-    private MelonPreferences_Entry<string> _originHotkey;
     private MelonPreferences_Entry<string> _transparencyHotkey;
+    private MelonPreferences_Entry<string> _abilityAreasHotkey;
     private MelonPreferences_Entry<float> _tickBudgetMs;
     private MelonPreferences_Entry<float> _dragTickBudgetMs;
     private MelonPreferences_Entry<float> _markLapSeconds;
@@ -86,6 +90,42 @@ public sealed class Mod : MelonMod
     // nowhere except where it was written.
     private const float StaleViewSeconds = 0.2f;
 
+    // The highest migration this build knows how to apply. A settings file records the last one it
+    // received, so each runs exactly once and a file that is already current is left alone.
+    private const int SettingsMigrationLevel = 1;
+
+    // Brings an older settings file forward, ONCE per migration, and that word is the whole design.
+    //
+    // Forcing a value on every launch would not be a migration, it would be the mod overruling the
+    // player forever, and it would make the setting a lie : someone who reads the file, sets the
+    // value they want and restarts would find it changed back, with nothing on screen to say why.
+    // Recording what has been applied is what lets an upgrade correct a state nobody chose while
+    // still losing every argument to a player who chooses afterwards.
+    private void ApplySettingsMigrations(MelonPreferences_Entry<int> level)
+    {
+        if (level == null || level.Value >= SettingsMigrationLevel) return;
+        bool arrowsRestored = false;
+        // 1 (2.3.0) : the arrow origin lost its button, and anyone left switched off had no way
+        // back that did not begin with knowing this file exists. Off was almost certainly a look
+        // someone tried rather than a preference held, which is the same observation that took the
+        // button away, so the upgrade puts it back on. Once. Set it to false after this has run and
+        // it stays false.
+        if (level.Value < 1 && !_arrowsFromGhosts.Value)
+        {
+            _arrowsFromGhosts.Value = true;
+            arrowsRestored = true;
+        }
+        level.Value = SettingsMigrationLevel;
+        MelonPreferences.Save();
+        // Only when something actually moved. A line printed on every fresh install is a line that
+        // cannot answer the one question it exists for, which is why the arrows look different
+        // today, and it would claim a change on files that had nothing to change.
+        if (arrowsRestored)
+            MelonLogger.Msg("[TargetingMod] settings brought forward: attack arrows start at the predicted " +
+                            "positions again, because the button that used to turn that off is gone. Set " +
+                            "ArrowsFromGhosts to false in the settings file if you want the old behaviour back.");
+    }
+
     public override void OnInitializeMelon()
     {
         // These are written to UserData/MelonPreferences.cfg on the first run, and the player
@@ -100,30 +140,49 @@ public sealed class Mod : MelonMod
         _devLog = category.CreateEntry("DevLog", false, "Verbose logs, plus a dump of the resolved UI.");
         _measureDrawCost = category.CreateEntry("MeasureDrawCost", false,
             "Diagnostic. Briefly blinks the board overlay on and off to measure what drawing it costs your machine. Leave off for normal play.");
-        // The two display choices behind the in-game toggles. Unlike the preview toggle, which
-        // starts off in every battle, these are remembered across battles and sessions.
+        // The display choices behind the in-game toggles. All of them are remembered across
+        // battles and across sessions : pressing a button writes its line here.
+        //
+        // The arrow origin lost its button in 2.3.0 and keeps its default, which has always been
+        // on. Anyone whose file said otherwise is put back on once by the migration above, since
+        // losing the button would otherwise strand them in a state they most likely never meant to
+        // keep. It is the picture the mod is FOR : an arrow that starts where a unit will be standing
+        // describes the fight that is going to happen, and one that starts where it is standing now
+        // describes a moment that never occurs. Off was the shape the mod first shipped with, kept
+        // for anyone who reads attribution faster that way, and it is not a choice worth a button
+        // in a row where every button costs the ones beside it.
         _arrowsFromGhosts = category.CreateEntry("ArrowsFromGhosts", true,
-            "Attack arrows start at the predicted positions instead of the current ones.");
+            "Attack arrows start at the predicted positions instead of the current ones. No in-game button; set it here.");
         // No in-game button and no shortcut, by owner ruling from play : with see-through units
         // making the board readable, the direction marks were the least useful of the four, and a
-        // button nobody presses is a button in the way of the three that matter. The setting stays
-        // here for anyone who wants them.
+        // button nobody presses is a button in the way of the ones that do get pressed. The setting
+        // stays here for anyone who wants them.
         _midlineHeads = category.CreateEntry("MidlineArrowheads", false,
             "Adds a direction chevron in the middle of each line. No in-game button; set it here.");
         _transparentUnits = category.CreateEntry("TransparentUnits", true,
             "Fades the units for the whole placement so you can see the board through them.");
-        // The preview deliberately starts off in every battle : a poll of players preferred
-        // meeting the ordinary board first. This is for the player who lives in the preview and
-        // does not want to switch it on every fight, so the default stands and the file decides.
+        // Ships false, because a poll of players preferred meeting the ordinary board on a first
+        // battle. After that the preview button writes this line itself, so the player who lives
+        // in the preview switches it on once rather than once a fight. The name is kept exactly as
+        // it was so that a file written by an older version still says what it meant.
         _previewStartsOn = category.CreateEntry("PreviewStartsOn", false,
-            "Starts each battle with the opening preview already on.");
+            "Starts each battle with the opening preview already on. The preview button writes this one too, so the file and the button can never disagree.");
+        // Ships true, because the areas have been drawn since 2.0.0 and this button exists to give
+        // them an off switch rather than to take them away. Off stops the twice-a-second scan that
+        // works them out as well as the drawing, so a player who does not want them does not pay
+        // for them either.
+        _abilityAreas = category.CreateEntry("AbilityAreas", true,
+            "Draws the ground each ability covers, for enemies as well as heroes. The in-game button writes this too, so the file and the button can never disagree.");
         _dragLivePreview = category.CreateEntry("DragLivePreview", true,
             "Computes the hex under a held hero. false hides the visuals while dragging.");
         // Any key name the Unity input system knows. The reasoning behind these three defaults is
         // beside the key parsing in NativeUI.
         _previewHotkey = category.CreateEntry("PreviewKey", "P", "Key that toggles the opening preview.");
-        _originHotkey = category.CreateEntry("ArrowOriginKey", "F", "Key that toggles where attack arrows start.");
         _transparencyHotkey = category.CreateEntry("TransparencyKey", "T", "Key that toggles see-through units.");
+        // Not A for area and not Z for zone, though both were the obvious ones. Both move under a
+        // different finger on AZERTY, which is the rule the other three were chosen by. G stays
+        // where it is on every common layout, the game does not use it, and it is next to F.
+        _abilityAreasHotkey = category.CreateEntry("AbilityAreasKey", "G", "Key that toggles the ability areas.");
         _tickBudgetMs = category.CreateEntry("TickBudgetMs", 2.0f,
             "Most simulation time allowed per frame during placement. Less is used when your machine has no time to spare.");
         // Dragging recomputes on every hex crossed, so it gets a bigger slice. A full playout was
@@ -150,13 +209,30 @@ public sealed class Mod : MelonMod
             "The run the mod has been active in. That run's scores are never submitted, even after the mod is switched off. Written by the mod.");
         var noticeShown = category.CreateEntry("LeaderboardNoticeShown", false,
             "Set once the leaderboard notice has been shown in the main menu. Written by the mod.");
+        // The one thing this mod does that reaches outside the game, and it is said plainly here
+        // and in the readme rather than left to be discovered. One request to GitHub per launch,
+        // asking only what the newest release is.
+        _checkForUpdates = category.CreateEntry("CheckForUpdates", true,
+            "Asks GitHub once per launch whether a newer version of the mod exists, and offers it in the main menu. false stops the mod contacting the internet at all.");
+        var lastUpdateSeen = category.CreateEntry("LastUpdateNoticeVersion", string.Empty,
+            "The newest version already offered in the main menu, so each one is offered once. Written by the mod.");
+        var migrationLevel = category.CreateEntry("SettingsMigration", 0,
+            "How far this settings file has been brought forward by the mod. Written by the mod.");
+        // Last, because a migration reads the entries above and they have to exist first.
+        ApplySettingsMigrations(migrationLevel);
 
         _capabilities = new Capabilities();
+        // Started before the guard, and deliberately. The case where the guard cannot be applied is
+        // a game update having moved something underneath the mod, and that is the single moment a
+        // player most needs to hear that a newer version exists. The menu's own unavailable text
+        // already tells them to check for one ; this is the mod doing the checking.
+        _updates = new UpdateCheck(_checkForUpdates, Bindings.ModVersion);
+        _updates.Start();
         _guard = new LeaderboardGuard(HarmonyInstance, _enabled, moddedRunId, noticeShown);
         // Built even when the guard failed, and deliberately so. A mod that has switched itself
         // off still has to be able to say that somewhere the player will actually look, and the
         // menu layer reads nothing and changes nothing until it is clicked.
-        _menu = new MenuUI(_capabilities, _guard);
+        _menu = new MenuUI(_capabilities, _guard, _updates, lastUpdateSeen, Bindings.ModVersion);
         // One window opened here as well as on every scene load, for the case where the menu scene
         // is already up by the time the loader gets to this mod. If it is not, the window expires
         // costing nothing and the scene hook catches the menu when it really arrives.
@@ -192,7 +268,13 @@ public sealed class Mod : MelonMod
         _glow = new PositionalGlow(_capabilities);
         _partGlow = new PartGlow(_capabilities, ItemMarkState, _glow.ForRelic, _glow.ForAbility,
             () => _markLapSeconds.Value, () => _glow.HasBlocked || _anchor.HasBlocked);
+        // The ability-key trace in both halves is diagnostic scaffolding and stays behind the
+        // player's own verbose switch. It is kept rather than deleted because printing the key each
+        // half composed is what ended the one bug in this feature that source reading could not.
+        _glow.DevLog = () => _devLog.Value;
+        _partGlow.DevLog = () => _devLog.Value;
         _aoe = new AoeShapes(_capabilities);
+        _multiHit = new MultiHit();
         _views = new UnitViewRegistry();
         _hover = new HoverService(_capabilities);
         _dragPreview = new DragPreviewService(_capabilities);
@@ -207,9 +289,11 @@ public sealed class Mod : MelonMod
         // playout was built for the hex under the cursor, so its answer is about the board the
         // player is considering rather than the one they are leaving.
         _shadow.OpeningEvaluator = _glow.ForOpeningFrame;
-        _ui = new NativeUI(_capabilities, value => _overlay.PreviewEnabled = value, _arrowsFromGhosts, _midlineHeads,
-            _transparentUnits, _previewStartsOn,
-            _previewHotkey, _originHotkey, _transparencyHotkey);
+        // Who hits more than one thing. Bound once, like the answers above it.
+        _shadow.Rules = _multiHit.For;
+        _ui = new NativeUI(_capabilities, value => _overlay.PreviewEnabled = value,
+            _transparentUnits, _previewStartsOn, _abilityAreas,
+            _previewHotkey, _transparencyHotkey, _abilityAreasHotkey);
         _hover.OwnUiProbe = _ui.OwnsGameObject;
         _census = new UiCensus(MelonEnvironment.UserDataDirectory);
         _phase.Transitioned += OnPhaseTransition;
@@ -408,6 +492,7 @@ public sealed class Mod : MelonMod
         _overlay.ArrowsFromGhosts = _arrowsFromGhosts.Value;
         _overlay.MidlineHeads = _midlineHeads.Value;
         _overlay.Transparent = _transparentUnits.Value;
+        _overlay.ShowAreas = _abilityAreas.Value;
         // Which equipped items and owned relics care about where units stand, and whether the
         // board as arranged is satisfying them. Both are asked before anything reads them : the
         // item icons ask the Seal watch and the placement marks what they think, and these two
@@ -416,7 +501,9 @@ public sealed class Mod : MelonMod
         using (Perf.Measure(PerfSlot.Anchor))
             _anchor.Update();
         using (Perf.Measure(PerfSlot.LiveSnapshot))
-            _glow.Update(preview == null);
+            // The occupancy signature the drag tracker computed a moment ago, handed on so the marks
+            // can skip a read that cannot produce a different answer. Free: that walk happens anyway.
+            _glow.Update(preview == null, _dragPreview.BoardSignature);
         // While a hero is in hand, the marks answer for the board that dropping it would make,
         // taken from that board's own playout. The moment it is put down there is nothing
         // hypothetical left, so this goes back to null and the real board answers again.
@@ -437,8 +524,14 @@ public sealed class Mod : MelonMod
             _partGlow.Update();
         // The ground each unit's ability will cover. Throttled inside like the two above : which
         // ability a unit has is authored data, and it changes at the speed of a person clicking.
+        //
+        // The player's switch is handed in rather than checked here, so that the scan and the
+        // drawing are refused in one place. Off, this stops the twice-a-second walk of every
+        // ability on the board, which is the whole cost of the feature : a display option that
+        // keeps paying for a picture it is not drawing is the wrong shape, and this mod has spent
+        // three cycles on exactly that kind of saving.
         using (Perf.Measure(PerfSlot.Aoe))
-            _aoe.Update();
+            _aoe.Update(_abilityAreas.Value);
         // While a hero is being dragged, it is the unit the visuals are about : with the preview
         // off, its own story at the hex it would land on ; with the preview on, the whole board
         // recomputed. Without a usable drag, holding a hero hides the board visuals as before.
@@ -730,10 +823,17 @@ public sealed class Mod : MelonMod
             if (_shadow != null) MelonLogger.Msg("[TargetingMod] drag response: " + _shadow.Diagnostic);
             if (_glow != null) MelonLogger.Msg("[TargetingMod] placement marks: " + _glow.Diagnostic);
             if (_partGlow != null) MelonLogger.Msg("[TargetingMod] icon marks: " + _partGlow.Diagnostic);
+            // Both halves of the areas, and they answer different questions. The first says what was
+            // WORKED OUT, the second says what reached the screen, and a feature can fail in the gap
+            // between them without either half looking wrong on its own. That gap is exactly what
+            // cost a play session on 2026-08-20.
+            if (_aoe != null) MelonLogger.Msg("[TargetingMod] ability areas: " + _aoe.Diagnostic);
+            if (_overlay != null) MelonLogger.Msg("[TargetingMod] area drawing: " + _overlay.AoeDiagnostic);
         }
         TearDown("positional glow", () => _glow?.Clear());
         TearDown("part glow marks", () => _partGlow?.Clear());
         TearDown("area outlines", () => _aoe?.Clear());
+        TearDown("multi-hit rules", () => _multiHit?.Clear());
         TearDown("drag tracker", () => _dragPreview?.Reset());
         TearDown("hover", () => _hover?.Clear());
         TearDown("placement UI", () => _ui?.LeavePlacement());
@@ -774,6 +874,9 @@ public sealed class Mod : MelonMod
             // clear its window on the way IN, because the report itself runs on the way out and
             // anything cleared there is cleared before it is printed.
             _shadow.EnterPlacement();
+        // Rebuilt per placement because a rank-up or a specialization between fights can
+        // change who reaches what. The per-ability answers behind it are kept.
+        _multiHit.Refresh();
         }
         if (previous == ModPhase.Placement && current == ModPhase.Resolution)
         {

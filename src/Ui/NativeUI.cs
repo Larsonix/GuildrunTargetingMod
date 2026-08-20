@@ -21,7 +21,7 @@ using UnityEngine.UI;
 
 namespace GuildrunTargetingMod.Ui;
 
-// The mod's own interface : three buttons, a status line, and the tooltips on the buttons.
+// The mod's own interface : four buttons, a status line, and the tooltips on the buttons.
 //
 // None of it is built from scratch. The buttons are clones of the game's speed toggles, so they
 // carry its art, its press animation and its click sound, and the tooltips are the game's own
@@ -31,17 +31,21 @@ internal sealed class NativeUI
 {
     private readonly Capabilities _capabilities;
     private readonly Action<bool> _previewChanged;
-    private readonly MelonPreferences_Entry<bool> _arrowsFromGhosts;
-    private readonly MelonPreferences_Entry<bool> _midlineHeads;
+    // Only the settings with a button are held here. The arrow origin and the direction marks are
+    // read straight off the renderer's own copy in Mod, because nothing in the interface asks about
+    // them any more : a setting this class cannot show and cannot change has no business being
+    // passed to it, and one that was is how the direction marks stayed wired in for three versions
+    // after their button was taken away.
     private readonly MelonPreferences_Entry<bool> _transparentUnits;
     private readonly MelonPreferences_Entry<bool> _previewStartsOn;
+    private readonly MelonPreferences_Entry<bool> _abilityAreas;
     private readonly MelonPreferences_Entry<string> _previewKey;
-    private readonly MelonPreferences_Entry<string> _originKey;
     private readonly MelonPreferences_Entry<string> _transparencyKey;
+    private readonly MelonPreferences_Entry<string> _abilityAreasKey;
     private readonly HashSet<string> _loggedBadKeys = new(StringComparer.Ordinal);
     private ModToggle _previewToggle;
-    private ModToggle _originToggle;
     private ModToggle _transparencyToggle;
+    private ModToggle _areasToggle;
     private readonly List<UnityEngine.Object> _ownedIconAssets = new();
     private GameObject _placementRoot;
     private TextMeshProUGUI _notice;
@@ -99,18 +103,18 @@ internal sealed class NativeUI
     };
 
     // Written for someone who has never used the mod : say what the button does, and what turning
-    // it off gives you, so nobody has to click all three to find out what they are.
+    // it off gives you, so nobody has to click all four to find out what they are.
     private static string PreviewTooltipTitle => "Opening preview";
-    private static string PreviewTooltipBody => "Shows the whole board at once: where every unit ends up, and who it is fighting there. Starts off again at the beginning of each battle.";
-
-    private static string OriginTooltipTitle => "Arrows from final positions";
-    private static string OriginTooltipBody => "Attack arrows start where units will be standing. Turn it off to make them start where units are right now.";
-
-    private static string MidHeadTooltipTitle => "Direction marks";
-    private static string MidHeadTooltipBody => "Adds a small arrow in the middle of every line, so you can tell which way it goes.";
+    private static string PreviewTooltipBody => "Shows the whole board at once: where every unit ends up, and who it is fighting there. Stays the way you leave it, in the next battle and the next session.";
 
     private static string TransparencyTooltipTitle => "See-through units";
     private static string TransparencyTooltipBody => "Fades the units so you can see the board through them, for the whole placement. Turn it off to keep them at full colour.";
+
+    // Says "enemies" out loud. The areas an enemy covers are the ones a placement is usually
+    // trying to stay out of, and a player who reads this as a hero-only feature has no reason to
+    // press it.
+    private static string AreasTooltipTitle => "Ability areas";
+    private static string AreasTooltipBody => "Outlines the ground each ability covers, for enemies as well as heroes, wherever the board is already showing something. Turn it off for a board with no outlines on it.";
 
     private static string StillMovingText => "Still moving";
 
@@ -133,20 +137,19 @@ internal sealed class NativeUI
     public bool PreviewEnabled => _previewToggle != null && _previewToggle.Toggle.isOn;
 
     public NativeUI(Capabilities capabilities, Action<bool> previewChanged,
-        MelonPreferences_Entry<bool> arrowsFromGhosts, MelonPreferences_Entry<bool> midlineHeads,
         MelonPreferences_Entry<bool> transparentUnits, MelonPreferences_Entry<bool> previewStartsOn,
-        MelonPreferences_Entry<string> previewKey, MelonPreferences_Entry<string> originKey,
-        MelonPreferences_Entry<string> transparencyKey)
+        MelonPreferences_Entry<bool> abilityAreas,
+        MelonPreferences_Entry<string> previewKey,
+        MelonPreferences_Entry<string> transparencyKey, MelonPreferences_Entry<string> abilityAreasKey)
     {
         _capabilities = capabilities;
         _previewChanged = previewChanged;
-        _arrowsFromGhosts = arrowsFromGhosts;
-        _midlineHeads = midlineHeads;
         _transparentUnits = transparentUnits;
         _previewStartsOn = previewStartsOn;
+        _abilityAreas = abilityAreas;
         _previewKey = previewKey;
-        _originKey = originKey;
         _transparencyKey = transparencyKey;
+        _abilityAreasKey = abilityAreasKey;
     }
 
     // P, F and D are not a matter of taste. Two things chose them.
@@ -158,7 +161,7 @@ internal sealed class NativeUI
     // non-QWERTY layouts, so any of them would land under a different finger there. P, F and D stay
     // in place. They also work as reminders: P for preview, F for from and D for direction.
     //
-    // All three can be changed anyway. Any key name works, and a name that means nothing costs
+    // All four can be changed anyway. Any key name works, and a name that means nothing costs
     // that one shortcut and a line in the log, rather than a guess.
     private Key ParseKey(MelonPreferences_Entry<string> entry, Key fallback)
     {
@@ -166,7 +169,7 @@ internal sealed class NativeUI
         if (string.IsNullOrWhiteSpace(raw)) return fallback;
         if (Enum.TryParse(raw.Trim(), true, out Key parsed) && parsed != Key.None) return parsed;
         // Once per setting, not once overall. One shared flag would report the first mistyped key
-        // and say nothing about the second, and someone rebinding all three at once is exactly
+        // and say nothing about the second, and someone rebinding all four at once is exactly
         // the person most likely to mistype two of them.
         if (_loggedBadKeys.Add(entry.Identifier))
             MelonLogger.Warning($"[TargetingMod] '{raw}' is not an InputSystem Key name; using {fallback} for {entry.Identifier}");
@@ -349,14 +352,19 @@ internal sealed class NativeUI
         }
         if (source == null) throw new InvalidOperationException("live SpeedToggleView unavailable");
 
-        // Left to right : arrow origin, opening preview, see-through units, then
-        // the game's own auto and speed buttons. Building them in that order and slotting each one
+        // Left to right : ability areas, opening preview, see-through units, then the game's own
+        // auto and speed buttons. Building them in that order and slotting each one
         // in ahead of the auto button grows the row leftward, so the game's buttons never move.
         // Transparency sits immediately after the preview because it only means anything while the
         // preview is on : the two read as a control and its modifier.
+        //
+        // The areas button is built first, which puts it on the far left, outside the other three.
+        // It is a layer of its own rather than a modifier of one, so it does not belong between a
+        // control and the thing that modifies it, and the outside edge is the one place that adds a
+        // fourth button without moving any of the pairs above.
         int fallbackIndex = 0;
-        _originToggle = CloneToggle(source, autoView, ref fallbackIndex,
-            "GuildrunTargetingMod.ArrowOriginToggle", MakeGhostIcon(), OnOriginChanged);
+        _areasToggle = CloneToggle(source, autoView, ref fallbackIndex,
+            "GuildrunTargetingMod.AbilityAreasToggle", MakeAreasIcon(), OnAreasChanged);
         _previewToggle = CloneToggle(source, autoView, ref fallbackIndex,
             "GuildrunTargetingMod.OpeningPreviewToggle", _previewIcon, OnPreviewChanged);
         _transparencyToggle = CloneToggle(source, autoView, ref fallbackIndex,
@@ -437,27 +445,34 @@ internal sealed class NativeUI
             MelonLogger.Msg("[TargetingMod] " + clone.name + ": hid cloned glyph image(s): " + hidden);
     }
 
+    // The preview is remembered like the other two, and for the same reason : a button that
+    // forgets what it was told is a button the player has to tell again every fight.
+    //
+    // Only a deliberate flip reaches here. Every time the mod itself moves this button, at the
+    // start of a placement and at the end of one, it goes through SetToggleSilently, which sets
+    // the value without notifying. So the mod's own teardown can never write itself into the
+    // player's settings, and this line records what the player asked for and nothing else.
     private void OnPreviewChanged(bool value)
     {
         ApplyToggleFeedback(_previewToggle, value);
         _previewChanged(value);
-    }
-
-    // The arrow origin and the direction marks are settings, not per-battle state. Unlike the
-    // preview, which starts off in every battle, they are remembered, so a click writes straight
-    // through to the settings file.
-    private void OnOriginChanged(bool value)
-    {
-        ApplyToggleFeedback(_originToggle, value);
-        _arrowsFromGhosts.Value = value;
+        _previewStartsOn.Value = value;
         MelonPreferences.Save();
     }
-
 
     private void OnTransparencyChanged(bool value)
     {
         ApplyToggleFeedback(_transparencyToggle, value);
         _transparentUnits.Value = value;
+        MelonPreferences.Save();
+    }
+
+    // Writes the setting the renderer reads and the scan is gated on, so one click stops both the
+    // drawing and the work behind it.
+    private void OnAreasChanged(bool value)
+    {
+        ApplyToggleFeedback(_areasToggle, value);
+        _abilityAreas.Value = value;
         MelonPreferences.Save();
     }
 
@@ -510,8 +525,8 @@ internal sealed class NativeUI
     private void ShowToggles(bool visible)
     {
         SetToggleVisible(_previewToggle, visible);
-        SetToggleVisible(_originToggle, visible);
         SetToggleVisible(_transparencyToggle, visible);
+        SetToggleVisible(_areasToggle, visible);
     }
 
     // A button's game object belongs to the battle scene, so by the time placement ends the game
@@ -540,8 +555,8 @@ internal sealed class NativeUI
         if (t == null) return false;
         IntPtr pointer = t.Pointer;
         return SameTransform(_previewToggle?.View?.transform, pointer)
-            || SameTransform(_originToggle?.View?.transform, pointer)
             || SameTransform(_transparencyToggle?.View?.transform, pointer)
+            || SameTransform(_areasToggle?.View?.transform, pointer)
             ;
     }
 
@@ -667,14 +682,18 @@ internal sealed class NativeUI
     public void EnterPlacement()
     {
         if (!Resolve(_previewIcon)) return;
-        // The preview starts off in every battle by default, because a poll of players preferred
-        // meeting the ordinary board first. A playtester who lives in the preview asked to keep
-        // it on instead, so the default stands and the setting decides. The display toggles are
-        // settings either way and come back the way the player left them.
+        // All four buttons come back the way the player left them.
+        //
+        // The preview used to start off in every battle, on a poll that preferred meeting the
+        // ordinary board first, and the only way to change that was a line in a file. Nobody opens
+        // the file, so what players saw was one button of three forgetting itself between fights.
+        // The poll is still served, because the setting still ships false and a first battle still
+        // opens on the ordinary board. What changed is who decides after that : the player's own
+        // click, rather than an edit they never make.
         bool preview = _previewStartsOn.Value;
         SetToggleSilently(_previewToggle, preview);
-        SetToggleSilently(_originToggle, _arrowsFromGhosts.Value);
         SetToggleSilently(_transparencyToggle, _transparentUnits.Value);
+        SetToggleSilently(_areasToggle, _abilityAreas.Value);
         ShowToggles(true);
         _previewChanged(preview);
         _lastTooltipKey = null;
@@ -739,9 +758,11 @@ internal sealed class NativeUI
         try
         {
             FlipOnKeyPress(_previewToggle, keyboard, ParseKey(_previewKey, Key.P));
-            FlipOnKeyPress(_originToggle, keyboard, ParseKey(_originKey, Key.F));
             // T for transparency, and it stays in place on the common layouts considered above.
             FlipOnKeyPress(_transparencyToggle, keyboard, ParseKey(_transparencyKey, Key.T));
+            // G for the areas. A for area and Z for zone were the two obvious ones and both are
+            // ruled out by the same test as above : they move on AZERTY. G does not.
+            FlipOnKeyPress(_areasToggle, keyboard, ParseKey(_abilityAreasKey, Key.G));
         }
         catch (Exception e)
         {
@@ -759,7 +780,7 @@ internal sealed class NativeUI
         toggle.Toggle.isOn = !toggle.Toggle.isOn;
     }
 
-    // Which of the three buttons the pointer is on, and what its tooltip says. The pointer can
+    // Which of the four buttons the pointer is on, and what its tooltip says. The pointer can
     // land on any piece inside a button, so the walk goes up until it finds one of ours.
     private bool TryGetToggleTooltip(GameObject go, out string key, out string title, out string body)
     {
@@ -777,16 +798,16 @@ internal sealed class NativeUI
                 title = WithShortcut(PreviewTooltipTitle, KeyLabel(ParseKey(_previewKey, Key.P)));
                 break;
             }
-            if (SameTransform(_originToggle?.View?.transform, pointer))
-            {
-                key = "ui:origin"; matched = _originToggle; body = OriginTooltipBody;
-                title = WithShortcut(OriginTooltipTitle, KeyLabel(ParseKey(_originKey, Key.F)));
-                break;
-            }
             if (SameTransform(_transparencyToggle?.View?.transform, pointer))
             {
                 key = "ui:transparency"; matched = _transparencyToggle; body = TransparencyTooltipBody;
                 title = WithShortcut(TransparencyTooltipTitle, KeyLabel(ParseKey(_transparencyKey, Key.T)));
+                break;
+            }
+            if (SameTransform(_areasToggle?.View?.transform, pointer))
+            {
+                key = "ui:areas"; matched = _areasToggle; body = AreasTooltipBody;
+                title = WithShortcut(AreasTooltipTitle, KeyLabel(ParseKey(_abilityAreasKey, Key.G)));
                 break;
             }
         }
@@ -932,25 +953,14 @@ internal sealed class NativeUI
         return new GameObject(name, types);
     }
 
-    // Two of the three button icons are drawn here, in code. The mod bundles no image, and the
-    // game has no sprite that says "ghost" or "chevron in the middle of a line", so these are
-    // white shapes tinted through the same colour the borrowed preview arrow uses. Each pixel is
-    // sampled four times, which is what keeps the edges clean at the size they are drawn.
-
-    private Sprite MakeGhostIcon()
-    {
-        return BakeIcon("GuildrunTargetingMod.GhostIcon", (x, y) =>
-        {
-            // Dome head + straight flanks, three cosine scallops on the hem, two punched eyes.
-            float body = y >= 36f
-                ? 20f - Mathf.Sqrt((x - 32f) * (x - 32f) + (y - 36f) * (y - 36f))
-                : Mathf.Min(x - 12f, 52f - x);
-            float hem = y - (10f + 6f * (0.5f + 0.5f * Mathf.Cos((x - 12f) / 40f * 6f * Mathf.PI)));
-            float eyeL = Mathf.Sqrt((x - 25f) * (x - 25f) + (y - 40f) * (y - 40f)) - 3.5f;
-            float eyeR = Mathf.Sqrt((x - 39f) * (x - 39f) + (y - 40f) * (y - 40f)) - 3.5f;
-            return Mathf.Min(Mathf.Min(body, hem), Mathf.Min(eyeL, eyeR));
-        });
-    }
+    // Two of the three button icons are drawn here, in code. The mod bundles no image, and the game
+    // has no sprite that says "see-through" or "the ground an ability covers", so these are white
+    // shapes tinted through the same colour the borrowed preview arrow uses. Each pixel is sampled
+    // four times, which is what keeps the edges clean at the size they are drawn.
+    //
+    // The ghost that stood for the arrow origin went with its button in 2.3.0. It is in the history
+    // if it is ever wanted back ; a shape nothing asks for is a shape that quietly stops matching
+    // the thing it was drawn to mean.
 
     private Sprite MakeTransparencyIcon()
     {
@@ -965,6 +975,26 @@ internal sealed class NativeUI
         });
     }
 
+
+    // A dashed ring, which is exactly what the feature draws : 690 of the 696 area shapes this
+    // build ships are circles, and every one of them is outlined rather than filled.
+    //
+    // The dashes are cut by angle rather than by arc length, which keeps them even on a circle and
+    // is one cosine instead of a length walk. Eight of them reads as dashed at 26 pixels ; twelve
+    // turned to a dotted grey line and four read as a broken ring.
+    private Sprite MakeAreasIcon()
+    {
+        return BakeIcon("GuildrunTargetingMod.AbilityAreasIcon", (x, y) =>
+        {
+            float dx = x - 32f, dy = y - 32f;
+            float toCentre = Mathf.Sqrt(dx * dx + dy * dy);
+            float ring = 3f - Mathf.Abs(toCentre - 21f);
+            // Positive on a dash, negative in a gap. Scaled by the radius so the cut has the same
+            // softness as the ring's own edge instead of aliasing into a hard step.
+            float wave = Mathf.Cos(Mathf.Atan2(dy, dx) * 8f) * 4f;
+            return Mathf.Min(ring, wave);
+        });
+    }
 
     private Sprite BakeIcon(string name, Func<float, float, float> distanceInside)
     {
@@ -1009,8 +1039,8 @@ internal sealed class NativeUI
         HideTooltip();
         SetUnitHudHidden(false);
         DestroyToggle(ref _previewToggle);
-        DestroyToggle(ref _originToggle);
         DestroyToggle(ref _transparencyToggle);
+        DestroyToggle(ref _areasToggle);
         for (int i = 0; i < _ownedIconAssets.Count; i++)
             if (_ownedIconAssets[i] != null) UnityEngine.Object.Destroy(_ownedIconAssets[i]);
         _ownedIconAssets.Clear();

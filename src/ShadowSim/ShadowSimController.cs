@@ -37,25 +37,22 @@ internal sealed class ShadowSimController
     // budget like everything else: a machine with no room defers it, so this bounds the wait
     // without imposing the cost on a machine that cannot pay it.
     private const float IdleRecheckSeconds = 0.2f;
-    // How long the picture from the hex the player has just left is allowed to stand while the hex
-    // they are now on is being worked out.
+    // THERE IS NO LONGER A STALE-PICTURE THRESHOLD, AND THE REASON IS KEPT SO IT IS NOT REINVENTED.
     //
-    // Holding it at all is deliberate and that part is unchanged: blanking the board the instant a
-    // candidate hex changes turns an ordinary sweep across the board into a strobe, and the live
-    // preview exists to remove exactly that. What was wrong was holding it without any limit. Past
-    // the point where a person stops reading a picture as the answer to what they are doing and
-    // starts waiting for one, an old picture is not continuity any more, it is a wrong answer to
-    // the question being asked. This mod refuses a wrong answer everywhere else it can give one,
-    // and a hero held over the interface already hides the visuals rather than inventing a board.
-    // This was the one place it went on answering with something it could not stand behind.
-    // Reported from play by a tester on a slower machine, who asked for precisely this.
+    // A constant here used to say how long the picture from the hex a player had just left was
+    // allowed to stand while the new hex was worked out. It was added to stop a sweep across the
+    // board reading as a strobe, and it was 120 ms.
     //
-    // A perception constant, so like the dwell above it is deliberately NOT scaled to the machine.
-    // Scaling it would defeat it: a machine that always takes half a second would set its own
-    // threshold at half a second and never blank, and that is the only machine this exists for.
-    // Measured on the reference machine a hex answers in a mean of 36 ms with cache hits counted,
-    // so the fast path stays well clear of this and nothing changes there.
-    private const float StalePictureSeconds = 0.12f;
+    // Measured 2026-08-20 across three sessions: it fired on 81%, 41% and 29% of drags, and the
+    // owner reported the result as flashing and unpolished. The mistake was not the number. It was
+    // that ANY hold means showing an answer about a hex the hero has already left, and this mod
+    // refuses a wrong answer everywhere else it can give one. The strobe the hold was avoiding was
+    // real, but the cure showed a falsehood to hide a flicker, and it produced two transitions per
+    // hex where an honest blank produces one.
+    //
+    // The picture is now tied to the candidate it was built for and disappears the instant they
+    // disagree. See the state test in UpdatePlacement. Nothing here is scaled to the machine any
+    // more, because there is no longer a duration to scale.
 
     private readonly Bindings _bindings;
     private readonly Capabilities _capabilities;
@@ -72,8 +69,22 @@ internal sealed class ShadowSimController
     private int _lastOverrideFromY;
     private int _lastOverrideToX;
     private int _lastOverrideToY;
+    // The candidate the picture currently on screen was built for. Compared by VALUE against the
+    // candidate the player is on, every frame, which is what turns "hide it the instant the hero
+    // leaves the hex" into a state the mod can always answer rather than a stopwatch it has to run.
+    // Deliberately not the cache key : that costs a whole config build and a hash, and this question
+    // has to be cheap enough to ask on every frame of a drag.
+    private bool _builtOverridePresent;
+    private int _builtFromX;
+    private int _builtFromY;
+    private int _builtToX;
+    private int _builtToY;
     private bool _wasDragging;
     private PredictionResult _lastAnnounced;
+    // The last playout taken off the runner, shown or not. Held separately from LastResult because a
+    // result that was cached without being shown must not be offered again on every following frame,
+    // and LastResult can no longer answer "have I already dealt with this one".
+    private PredictionResult _lastTakenFromRunner;
     private bool _rebuildPending;
     private bool _decision;
     private float _candidateSince;
@@ -127,6 +138,12 @@ internal sealed class ShadowSimController
         }
     }
 
+    /// <summary>Passed straight to the runner ; see <see cref="Runner.Rules"/>.</summary>
+    public Func<string, MultiHit.Rule> Rules
+    {
+        set => _runner.Rules = value;
+    }
+
     /// <summary>Passed straight to the runner ; see <see cref="Runner.OpeningEvaluator"/>.</summary>
     public Func<Frame, PlacementSnapshot> OpeningEvaluator
     {
@@ -156,7 +173,13 @@ internal sealed class ShadowSimController
         // On a hex where releasing would work, predict the board that release would produce. On a
         // hex where it would not, predict the board unchanged, because that is what the player
         // gets if they let go there.
-        BoardOverride? over = dragging && drag.CandidateValid
+        //
+        // A hero held over its OWN hex is "no change", spelled that way rather than as a hex
+        // exchanged with itself. ConfigMirror swaps the two cells, so an override of a hex onto
+        // itself already produced a byte-identical config and therefore an identical cache key; the
+        // two forms were always the same board and only one of them said so. Normalising it here is
+        // what lets everything below compare candidates by value instead of having to know that.
+        BoardOverride? over = dragging && drag.CandidateValid && drag.CandidateCell != drag.StartCell
             ? new BoardOverride(drag.StartCell, drag.CandidateCell)
             : null;
         // Asking whether the board changed means rebuilding the whole config and hashing it, so the
@@ -217,23 +240,32 @@ internal sealed class ShadowSimController
         _lastOverridePresent = over.HasValue;
         _wasDragging = dragging;
 
-        // The answer on screen is now older than a player will wait for one, so it stops being
-        // shown. Nothing is recomputed here and nothing is cancelled: the playout that will answer
-        // this hex is already running or about to start, and this only stops the previous hex's
-        // answer from standing in for it in the meantime. What clears is the board overlay alone,
-        // the arcs, the ghost copies, the tiles and the footprints. The see-through bodies, the
-        // hidden unit panels and the placement marks are all held on purpose, because none of them
-        // waits for a playout to finish: the marks are taken from the new board's opening frame and
-        // are already correct, and the other two follow their toggles rather than the prediction.
+        // THE PICTURE STOPS THE INSTANT THE HERO LEAVES THE HEX IT DESCRIBES.
         //
-        // Driven by the same clock the drag response figure is measured with, because it is the
-        // same quantity. That field is set when the candidate hex changes and cleared when the hex
-        // is answered, so "a hex is waiting" and "the picture is stale" cannot drift apart. It also
-        // restarts on each new candidate, which is what keeps a sweep across the board from
-        // blanking: during one the player is moving rather than reading, and the wait that matters
-        // starts from the hex they stop on.
-        if (dragging && LastResult != null && _previewRequestedAt >= 0f &&
-            now - _previewRequestedAt >= StalePictureSeconds)
+        // Owner ruling, 2026-08-20: "either you show the answer instantly, and if we cannot because
+        // it would cause performance problems then we hide the targeting from the previous hex the
+        // instant it leaves it."
+        //
+        // This replaced a timer, and the timer was the thing that looked broken. It held the old
+        // hex's arrows for 120 ms before blanking, so one hex change produced THREE pictures: the
+        // right one, then 120 ms of an answer about a hex the hero had already left, then nothing,
+        // then the new one. The middle picture is the only one of the four that was ever wrong, and
+        // it is the one the player reported as flashing. Two transitions where there should be one.
+        //
+        // Asked as a STATE rather than as a timer, which is what makes it exact: the picture belongs
+        // to the candidate it was built for, so the moment the player is on a different candidate it
+        // is a wrong answer and goes. No threshold to tune, and nothing behaves differently on a
+        // slower machine, which the timer plainly did.
+        //
+        // What clears is the board overlay alone : the arcs, the ghost copies, the tiles and the
+        // footprints. The see-through bodies, the hidden unit panels and the placement marks are all
+        // held on purpose, because none of them waits for a playout: the marks are taken from the new
+        // board's opening frame and are already correct the same frame the hex changes, and the other
+        // two follow their toggles rather than the prediction.
+        bool pictureDescribesThisCandidate = _builtOverridePresent == over.HasValue &&
+            (!over.HasValue || (over.Value.FromCell.x == _builtFromX && over.Value.FromCell.y == _builtFromY &&
+                                over.Value.ToCell.x == _builtToX && over.Value.ToCell.y == _builtToY));
+        if (dragging && !pictureDescribesThisCandidate && LastResult != null)
         {
             LastResult = null;
             _previewCleared++;
@@ -292,7 +324,42 @@ internal sealed class ShadowSimController
             using (Perf.Measure(PerfSlot.MirrorBuild))
                 mirrorBuilt = _mirror.TryBuild(_bindings.BuildGuid, over, out config, out hash, out key);
             if (!mirrorBuilt) return;
-            if (!string.Equals(key, _activeKey, StringComparison.Ordinal))
+            // Whatever this rebuild settles on, it settles it FOR this candidate. Recorded before the
+            // branch below rather than inside it, because the branch is skipped when the key has not
+            // moved, and "the key did not move" is precisely the case where the picture already on
+            // screen is the right answer for this candidate and must not be blanked for it.
+            _builtOverridePresent = over.HasValue;
+            if (over.HasValue)
+            {
+                _builtFromX = over.Value.FromCell.x;
+                _builtFromY = over.Value.FromCell.y;
+                _builtToX = over.Value.ToCell.x;
+                _builtToY = over.Value.ToCell.y;
+            }
+            // The key changed, OR the key is the same and there is nothing left to show for it.
+            //
+            // THE SECOND HALF IS NOT BELT AND BRACES. IT IS THE WHOLE OF A LATCH.
+            //
+            // _activeKey is a claim: this board has an answer, either finished in LastResult or
+            // being played out right now. Two places break that claim without touching the key.
+            // The stale-picture clear above sets LastResult to null, and Runner.Cancel sets the
+            // runner's Result to null, which the cache-hit branch below does WITHOUT starting a
+            // run after it. Once both have happened the controller holds a key it cannot draw, and
+            // a test on the key alone then refuses to rebuild the one board that needs it: the
+            // idle re-check computes the same key twice a second and skips, and the accept test at
+            // the end of this method has a null result to offer. The board stays empty for the
+            // rest of the placement.
+            //
+            // Only an edit that really moves a hero breaks that tie, because only that changes the
+            // key. Picking a hero up and putting it back down does NOT, and that is the part that
+            // makes it look like the mod has died rather than paused: an override of a hex onto
+            // itself exchanges a tile with itself, so ConfigMirror serializes the identical config
+            // and hands back the identical key.
+            //
+            // Asked as "have I an answer" rather than by clearing the key at each of the two
+            // places that can lose one, so that a third way of losing one cannot reopen this.
+            bool haveAnswer = LastResult != null || _runner.IsRunning;
+            if (!string.Equals(key, _activeKey, StringComparison.Ordinal) || !haveAnswer)
             {
                 // Before the run is discarded, keep what it already answered. The opening answer is
                 // final the moment it exists, so a playout abandoned halfway still produced a real
@@ -317,12 +384,18 @@ internal sealed class ShadowSimController
                         using (Perf.Measure(PerfSlot.SimStart))
                             _runner.Start(config, hash, key);
                         _activeKey = key;
-                        // Outside a drag, an out of date prediction is never shown. During one it
-                        // is held for the moment the new playout needs, because blanking on every
-                        // hex crossed is the flicker the live preview exists to remove, and no
-                        // fight can start while a hero is held. That hold is bounded rather than
-                        // open ended : see StalePictureSeconds above, which clears it once the
-                        // wait is long enough that the player is reading it as this hex's answer.
+                        // Outside a drag, an out of date prediction is never shown, and this is the
+                        // line that says so.
+                        //
+                        // It reads as though a drag were the exception that keeps the old picture,
+                        // and that is no longer true : the candidate test near the top of this
+                        // method has already cleared it on the frame the hero left the hex this
+                        // picture describes. By the time a new playout starts for a NEW candidate
+                        // there is nothing left to hold, so the branch below is reached during a
+                        // drag only when the candidate has not moved, which is exactly when holding
+                        // is right. Kept as a guard rather than removed, because "not dragging" and
+                        // "the candidate changed" are two different reasons and only one of them
+                        // lives up there.
                         if (!dragging) LastResult = null;
                     }
                     catch (Exception e)
@@ -332,6 +405,22 @@ internal sealed class ShadowSimController
                         return;
                     }
                 }
+            }
+            else if (LastResult != null)
+            {
+                // Same board, and its answer is already on screen. That IS this hex's answer and
+                // it arrived in no time at all, so the wait is over and is recorded as over, the
+                // same way a cache hit is.
+                //
+                // It was not recorded before, and the omission was doing two things. It left the
+                // latency figure describing only the hexes that had to be computed, so the fastest
+                // answers the mod gives were the ones missing from its own report. And it left
+                // _previewRequestedAt running against a request nothing would ever clear, so the
+                // stale-picture clear above eventually blanked a picture that was correct for the
+                // board in front of the player. Deliberately NOT extended to the case where a run
+                // is still in flight for this key: nothing is on screen then, the wait is real,
+                // and AcceptResult will record it when the playout lands.
+                NotePreviewAnswered();
             }
         }
         try
@@ -345,8 +434,21 @@ internal sealed class ShadowSimController
             _capabilities.DisablePrediction("shadow runner failed: " + e);
             return;
         }
-        if (_runner.Result == null || ReferenceEquals(_runner.Result, LastResult)) return;
-        AcceptResult(_runner.Result);
+        // A FINISHED PLAYOUT IS ALWAYS WORTH KEEPING. IT IS NOT ALWAYS WORTH SHOWING.
+        //
+        // These were one decision and had to become two. The clear at the top of this method drops
+        // the picture the moment the hero leaves the hex it describes, and this line then handed the
+        // just-finished playout for that same abandoned hex straight back, in the SAME frame, after
+        // the clear had already run. The board therefore went on showing the hex the player had left,
+        // which is precisely the thing the clear exists to prevent and precisely the thing that was
+        // reported. Measured before the split: 851 clears against 110 answered previews.
+        //
+        // Caching it regardless is not a consolation prize, it is the point: the player sweeping back
+        // across that hex gets it instantly, and throwing the work away would make a re-crossing pay
+        // for a whole playout twice.
+        if (_runner.Result == null || ReferenceEquals(_runner.Result, _lastTakenFromRunner)) return;
+        _lastTakenFromRunner = _runner.Result;
+        AcceptResult(_runner.Result, showIt: pictureDescribesThisCandidate);
     }
 
     public PredictionResult BuildFinalPrediction()
@@ -373,7 +475,9 @@ internal sealed class ShadowSimController
             }
             if (_runner.Result == null) return fallback;
             _activeKey = key;
-            AcceptResult(_runner.Result);
+            // Always shown. This is the final prediction for the board the fight is about to run on,
+            // built with no drag override at all, so there is no candidate hex left to disagree with.
+            AcceptResult(_runner.Result, showIt: true);
             return LastResult;
         }
         catch (Exception e)
@@ -397,8 +501,14 @@ internal sealed class ShadowSimController
         _lastOverrideFromY = 0;
         _lastOverrideToX = 0;
         _lastOverrideToY = 0;
+        _builtOverridePresent = false;
+        _builtFromX = 0;
+        _builtFromY = 0;
+        _builtToX = 0;
+        _builtToY = 0;
         _wasDragging = false;
         _lastAnnounced = null;
+        _lastTakenFromRunner = null;
         _rebuildPending = false;
         _decision = false;
         _candidateSince = 0f;
@@ -504,8 +614,11 @@ internal sealed class ShadowSimController
     public string Diagnostic => _previewSamples == 0
         ? "no drag preview was answered this placement"
         : $"{_previewSamples} drag preview(s) answered, mean {_previewTotalMs / _previewSamples:F0} ms, " +
-          $"worst {_previewWorstMs:F0} ms, {_previewCleared} cleared after " +
-          $"{StalePictureSeconds * 1000f:F0} ms";
+          $"worst {_previewWorstMs:F0} ms, {_previewCleared} hidden on a hex change. " +
+          // The mean is now the only number that decides how this feels. With the hold gone, every
+          // hex change blanks until its answer lands, so the wait IS the experience and there is no
+          // threshold left to blame for a flicker.
+          "The mean is what a player waits between moving onto a hex and seeing it answered";
 
     private void NotePreviewAnswered()
     {
@@ -520,11 +633,18 @@ internal sealed class ShadowSimController
         if (ms > _previewWorstMs) _previewWorstMs = ms;
     }
 
-    private void AcceptResult(PredictionResult result)
+    /// <param name="showIt">
+    /// Whether this playout answers the hex the hero is on NOW. False means keep it and say nothing:
+    /// it is a correct answer to a question the player has stopped asking.
+    /// </param>
+    private void AcceptResult(PredictionResult result, bool showIt)
     {
+        // Cached whatever the cursor has done since, because a cache entry is about a BOARD and not
+        // about where the pointer happens to be.
+        CacheResult(result);
+        if (!showIt) return;
         NotePreviewAnswered();
         LastResult = result;
-        CacheResult(result);
         if (!_devLog() || ReferenceEquals(_lastAnnounced, result)) return;
         _lastAnnounced = result;
         string targets = string.Join(", ", result.Tick0Targets.Select(x => Short(x.Key) + "->" + Short(x.Value)));

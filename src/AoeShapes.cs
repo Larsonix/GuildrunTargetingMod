@@ -24,15 +24,49 @@ internal sealed class AoeOutline
     public readonly Vector2[][] Loops;
 
     /// <summary>
+    /// How far the shape reaches from its own origin, in world units. Used to tell a footprint a
+    /// player can step out of from one that covers the board whatever they do.
+    /// </summary>
+    public readonly float MaxReach;
+
+    /// <summary>
     /// Whether turning the unit turns the shape. A circle does not care, and 690 of the 696 shapes
     /// this build ships are circles, so this is false nearly everywhere.
     /// </summary>
     public readonly bool RotatesWithFacing;
 
-    public AoeOutline(Vector2[][] loops, bool rotatesWithFacing)
+    /// <summary>
+    /// Whether every part of this footprint is a circle, which is what makes <see cref="MaxReach"/>
+    /// mean "how much ground this covers" rather than merely "how far its furthest point is".
+    /// </summary>
+    /// <remarks>
+    /// For a circle the two are the same number and the reach is a fair measure of coverage. For a
+    /// rectangle they are not related at all: a long narrow beam has a distant furthest corner and
+    /// covers almost no ground, and a player steps out of it sideways.
+    ///
+    /// Measured 2026-08-20 across all 27 authored areas in this build. Four were being refused as
+    /// covering the whole board. Three were the Dragons' Flame, Frost and Poison Breath, circles of
+    /// reach 12.00, and refusing those is the feature working. The fourth was Requiem Barrage, a
+    /// RECTANGLE of reach 24.83, which is dodgeable and was being hidden on every board it appeared
+    /// on. That was the reported "ability areas do not work at all", and no threshold could have
+    /// fixed it: the next rectangles down sit at 11.36, just under the cutoff, so moving the line
+    /// either keeps hiding a dodgeable shape or starts showing an undodgeable one.
+    /// </remarks>
+    public readonly bool AllCircles;
+
+    public AoeOutline(Vector2[][] loops, bool rotatesWithFacing, bool allCircles)
     {
         Loops = loops;
         RotatesWithFacing = rotatesWithFacing;
+        AllCircles = allCircles;
+        float reach = 0f;
+        for (int i = 0; i < loops.Length; i++)
+            for (int j = 0; j < loops[i].Length; j++)
+            {
+                float d = loops[i][j].magnitude;
+                if (d > reach) reach = d;
+            }
+        MaxReach = reach;
     }
 }
 
@@ -88,12 +122,32 @@ internal sealed class AoeShapes
     private readonly HashSet<string> _seenActionNames = new(StringComparer.Ordinal);
     private int _actionsWalked;
     private float _nextScanAt;
+    // Whether the last Update was refused, either by the player's switch or by a fault. Kept so
+    // that going quiet is an event rather than a state polled every frame ; see Update.
+    private bool _quiet;
     private int _consecutiveFaults;
     private bool _loggedFirstResult;
     private string _lastFault;
     private int _ambiguous;
+    // Abilities the balancing lookup could not read on the last scan. NOT cached as "has no area",
+    // and counted so that a board where this is persistently non-zero is visible rather than just
+    // quiet. Reset per scan, because it describes the scan and not the session.
+    private int _unreadable;
 
     public AoeShapes(Capabilities capabilities) => _capabilities = capabilities;
+
+    /// <summary>What the last scan found, for the log at the end of a placement.</summary>
+    /// <remarks>
+    /// Printed per placement rather than once per session. LogFirstResult below fires on the FIRST
+    /// scan of a session, which is the opening battle of a run: no specializations, no rank
+    /// modifiers, often nothing with an area at all. Every log this mod has produced therefore
+    /// reports the emptiest board of the session and nothing afterwards, which is how a feature can
+    /// stop working for a whole session without a single line saying so.
+    /// </remarks>
+    public string Diagnostic =>
+        $"{_byUnit.Count} unit(s) with a footprint, {_abilitiesWithoutShape.Count} ability(ies) " +
+        $"known to place none, {_ambiguous} refused as ambiguous, {_unreadable} unreadable this scan" +
+        (_quiet ? "; the player's switch or a fault has this feature off" : "");
 
     /// <summary>The footprint for a unit, or null when there is nothing honest to draw.</summary>
     public AoeOutline For(string entityId) =>
@@ -107,9 +161,35 @@ internal sealed class AoeShapes
     public int Version { get; private set; }
 
     /// <summary>Safe to call every frame ; recomputes a couple of times a second.</summary>
-    public void Update()
+    /// <param name="wanted">
+    /// The player's own switch, from the ability areas button. False stops the scan as well as the
+    /// drawing : this walk is the entire cost of the feature, and a display option that keeps
+    /// paying for a picture nobody is drawing is the wrong shape.
+    /// </param>
+    /// <remarks>
+    /// Kept apart from <see cref="Capabilities.AoeOutline"/> on purpose, and both are honoured
+    /// here. That one means the feature broke and said so in the log ; this one means the player
+    /// asked for it to stop. Reading them as one switch would let a fault silently flip a button
+    /// the player owns, and would make a deliberate choice look like a defect in the log.
+    /// </remarks>
+    public void Update(bool wanted)
     {
-        if (!_capabilities.AoeOutline) return;
+        if (!_capabilities.AoeOutline || !wanted)
+        {
+            // Once on the way down, not once per frame. Clear bumps the version, the renderer
+            // redraws whenever the version moves, and a switch whose whole purpose is to save work
+            // would then have cost a full redraw sixty times a second for as long as it was off.
+            if (!_quiet)
+            {
+                _quiet = true;
+                Clear();
+                Version++;
+            }
+            return;
+        }
+        // Clear leaves the next scan due immediately, so switching the areas back on shows them on
+        // the next frame rather than up to half a second later.
+        _quiet = false;
         float now;
         try { now = Time.realtimeSinceStartup; }
         catch { now = 0f; }
@@ -139,6 +219,7 @@ internal sealed class AoeShapes
         {
             if (!DataReaders.TryGet<GameRegistryDataReader>(out var registry) || registry == null) return;
             _byUnit.Clear();
+            _unreadable = 0;
             foreach (HeroData hero in registry.Data.Heroes.Values)
             {
                 if (hero == null || !hero.HasActiveAbility) continue;
@@ -174,18 +255,45 @@ internal sealed class AoeShapes
         if (_abilitiesWithoutShape.Contains(key)) return;
         if (!_byAbility.TryGetValue(key, out AoeOutline outline))
         {
-            outline = Build(abilityRef);
-            if (outline == null) { _abilitiesWithoutShape.Add(key); return; }
+            outline = Build(abilityRef, out bool readable);
+            if (outline == null)
+            {
+                // ONLY AN ABILITY THAT WAS ACTUALLY READ MAY BE REMEMBERED AS HAVING NO AREA.
+                //
+                // This set is never cleared, on purpose : whether an ability places an area is
+                // authored data and does not change during a run. That is only true of an answer,
+                // and until now a FAILURE to read one was filed here as though it were an answer.
+                // The first scan runs about three quarters of a second into a placement, while the
+                // scene is still assembling, which is exactly when the balancing lookup can hand
+                // back nothing. One such moment silently retired that ability's footprint for the
+                // rest of the session, with no log line and no way back short of a relaunch.
+                //
+                // The lesson is already written three times in this codebase, in ConfigMirror,
+                // PositionalGlow and PartGlow : a reader caught mid setup is a passing condition,
+                // and treating one as permanent has cost this mod a session before. This was the
+                // one place it had not been applied.
+                if (readable) _abilitiesWithoutShape.Add(key);
+                else _unreadable++;
+                return;
+            }
             _byAbility[key] = outline;
         }
         _byUnit[entityId] = outline;
     }
 
-    private AoeOutline Build(BalancingRef<IActiveAbilityEntry> abilityRef)
+    /// <param name="readable">
+    /// Whether the ability could be read at all. False means try again next scan; true means the
+    /// answer is "this ability places no area" and is safe to remember for the run.
+    /// </param>
+    private AoeOutline Build(BalancingRef<IActiveAbilityEntry> abilityRef, out bool readable)
     {
+        readable = false;
         IActiveAbilityEntry entry = EmberBalancing.Instance.Get<IActiveAbilityEntry>(abilityRef);
         Il2CppReferenceArray<IAbilityAction> actions = entry?.AbilityActions;
         if (actions == null) return null;
+        // Past this point the ability was read. Everything below is a real answer about it,
+        // including the deliberate refusal in the ambiguous case, so all of it may be remembered.
+        readable = true;
 
         AoeOutline chosen = null;
         for (int i = 0; i < actions.Length; i++)
@@ -225,6 +333,7 @@ internal sealed class AoeShapes
         if (collisors == null || collisors.Length == 0) return null;
         var loops = new List<Vector2[]>(collisors.Length);
         bool rotates = false;
+        bool allCircles = true;
         for (int i = 0; i < collisors.Length; i++)
         {
             ICollisor collisor = collisors[i];
@@ -244,8 +353,9 @@ internal sealed class AoeShapes
             // circle, the shape's own centre is carried separately and is not added to them.
             loops.Add(new[] { ToVector(rect.P1), ToVector(rect.P2), ToVector(rect.P3), ToVector(rect.P4) });
             rotates = true;
+            allCircles = false;
         }
-        return loops.Count == 0 ? null : new AoeOutline(loops.ToArray(), rotates);
+        return loops.Count == 0 ? null : new AoeOutline(loops.ToArray(), rotates, allCircles);
     }
 
     private static Vector2[] CircleLoop(Vector2 center, float radius)

@@ -21,7 +21,7 @@ namespace GuildrunTargetingMod;
 // its own and stays there until one battle proves the prediction against the real fight.
 internal sealed class Bindings
 {
-    internal const string ModVersion = "2.2.0";
+    internal const string ModVersion = "2.5.1";
 
     // How many battles in a row have to disagree before the preview is taken away.
     //
